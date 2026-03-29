@@ -1,128 +1,215 @@
-// CORTEX - Main Game Controller
-import { generatePuzzle, getMaxTime, getDifficultyLabel, PROP_LABELS } from './puzzle.js';
+// HIVEMIND - Main Game Controller
+// "One Mind. Many Bodies. Zero Margin for Error."
+
+import {
+  generateLevel, moveAgent, checkWin, getStars,
+  getDifficulty, AGENT_COLORS, AGENT_NAMES, applyToggle
+} from './level.js';
 import { Renderer } from './renderer.js';
-import { getLeaderboard, addEntry, getRank } from './leaderboard.js';
+import {
+  getLeaderboard, addEntry, getRank,
+  saveLevelResult, getMaxUnlockedLevel, getTotalStars
+} from './leaderboard.js';
+
+// ── Constants ──────────────────────────────────────────
+const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4 };
+const ANIM_DURATION = 120; // ms
 
 // ── State ──────────────────────────────────────────────
-const State = { MENU: 0, PLAYING: 1, FEEDBACK: 2, GAME_OVER: 3, LEADERBOARD: 4 };
-
 let state = State.MENU;
-let level = 1;
-let score = 0;
-let lives = 3;
-let streak = 0;
-let bestStreak = 0;
-let puzzle = null;
-let selectedChoice = -1;
-let timerStart = 0;
-let elapsed = 0;
-let feedbackCorrect = false;
-let feedbackTimer = 0;
-let hoverChoice = -1;
-let animFrame = 0;
+let level = null;        // current level data
+let levelNum = 1;
+let positions = [];      // current agent positions [{row,col}, ...]
+let displayPos = [];     // animated display positions [{row,col}, ...]
+let moveCount = 0;
+let undoStack = [];
+let totalScore = 0;
+let totalStars = 0;
+let lives = 5;
+let animating = false;
+let animStart = 0;
+let animFrom = [];
+let animTo = [];
+let lastMoveDir = null;
+let winTime = 0;
 let particles = [];
+let mouseX = 0, mouseY = 0;
 
-// ── Canvas Setup ───────────────────────────────────────
+// Swipe tracking
+let touchStartX = 0, touchStartY = 0;
+let touchStartTime = 0;
+
+// ── Canvas ─────────────────────────────────────────────
 const canvas = document.getElementById('game');
 const renderer = new Renderer(canvas);
 let W, H;
 
-function resizeCanvas() {
-  W = Math.min(window.innerWidth, 600);
+function resize() {
+  W = Math.min(window.innerWidth, 650);
   H = window.innerHeight;
   renderer.resize(W, H);
 }
-window.addEventListener('resize', resizeCanvas);
-resizeCanvas();
+window.addEventListener('resize', resize);
+resize();
 
 // ── Input ──────────────────────────────────────────────
-let mouseX = 0, mouseY = 0;
+
+document.addEventListener('keydown', e => {
+  if (state === State.PLAYING && !animating) {
+    const map = {
+      ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+      w: 'up', s: 'down', a: 'left', d: 'right',
+      W: 'up', S: 'down', A: 'left', D: 'right'
+    };
+    if (map[e.key]) { e.preventDefault(); executeMove(map[e.key]); }
+    if (e.key === 'z' || e.key === 'Z') undo();
+    if (e.key === 'r' || e.key === 'R') resetLevel();
+  }
+  if (state === State.MENU && (e.key === 'Enter' || e.key === ' ')) startGame();
+  if (state === State.WIN && (e.key === 'Enter' || e.key === ' ')) nextLevel();
+});
 
 canvas.addEventListener('mousemove', e => {
-  const rect = canvas.getBoundingClientRect();
-  mouseX = e.clientX - rect.left;
-  mouseY = e.clientY - rect.top;
+  const r = canvas.getBoundingClientRect();
+  mouseX = e.clientX - r.left;
+  mouseY = e.clientY - r.top;
 });
 
 canvas.addEventListener('click', e => {
-  const rect = canvas.getBoundingClientRect();
-  const cx = e.clientX - rect.left;
-  const cy = e.clientY - rect.top;
-  handleClick(cx, cy);
+  const r = canvas.getBoundingClientRect();
+  handleClick(e.clientX - r.left, e.clientY - r.top);
 });
 
 canvas.addEventListener('touchstart', e => {
-  e.preventDefault();
-  const rect = canvas.getBoundingClientRect();
-  const touch = e.touches[0];
-  const cx = touch.clientX - rect.left;
-  const cy = touch.clientY - rect.top;
-  mouseX = cx;
-  mouseY = cy;
-  handleClick(cx, cy);
-}, { passive: false });
+  const t = e.touches[0];
+  const r = canvas.getBoundingClientRect();
+  touchStartX = t.clientX - r.left;
+  touchStartY = t.clientY - r.top;
+  touchStartTime = performance.now();
+  mouseX = touchStartX;
+  mouseY = touchStartY;
+}, { passive: true });
 
-// ── Layout helpers ─────────────────────────────────────
-function getGridLayout() {
-  const gridSize = Math.min(W * 0.8, 330);
-  const cellSize = (gridSize - 16) / 3;
-  const gx = (W - gridSize) / 2;
-  const gy = 140;
-  return { gx, gy, gridSize, cellSize, gap: 8 };
-}
+canvas.addEventListener('touchend', e => {
+  const t = e.changedTouches[0];
+  const r = canvas.getBoundingClientRect();
+  const endX = t.clientX - r.left;
+  const endY = t.clientY - r.top;
+  const dx = endX - touchStartX;
+  const dy = endY - touchStartY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  const dt = performance.now() - touchStartTime;
 
-function getChoiceLayout() {
-  const { gy, gridSize } = getGridLayout();
-  const top = gy + gridSize + 40;
-  const choiceSize = Math.min((W - 60) / 4 - 8, 90);
-  const totalW = choiceSize * 4 + 24;
-  const startX = (W - totalW) / 2;
-  return { top, choiceSize, startX };
-}
-
-function getChoiceAt(cx, cy) {
-  const { top, choiceSize, startX } = getChoiceLayout();
-  if (cy < top || cy > top + choiceSize) return -1;
-  for (let i = 0; i < 4; i++) {
-    const x = startX + i * (choiceSize + 8);
-    if (cx >= x && cx <= x + choiceSize) return i;
+  if (dist < 15 && dt < 300) {
+    // Tap
+    handleClick(endX, endY);
+  } else if (dist > 30 && state === State.PLAYING && !animating) {
+    // Swipe
+    if (Math.abs(dx) > Math.abs(dy)) {
+      executeMove(dx > 0 ? 'right' : 'left');
+    } else {
+      executeMove(dy > 0 ? 'down' : 'up');
+    }
   }
-  return -1;
+}, { passive: true });
+
+// ── Layout ─────────────────────────────────────────────
+
+function getMazeLayout() {
+  if (!level) return { layouts: [], cellSize: 0 };
+  const n = level.numAgents;
+  const gs = level.gridSize;
+  const headerH = 100;
+  const footerH = 120;
+  const availW = W - 32;
+  const availH = H - headerH - footerH;
+
+  let cols, rows;
+  if (n <= 2) { cols = 2; rows = 1; }
+  else if (n <= 3) { cols = 3; rows = 1; }
+  else if (n <= 4) { cols = 2; rows = 2; }
+  else { cols = 3; rows = 2; }
+
+  const gapX = 16;
+  const gapY = 30;
+  const maxCellW = (availW - (cols - 1) * gapX) / (cols * gs);
+  const maxCellH = (availH - (rows - 1) * gapY) / (rows * gs);
+  const cellSize = Math.floor(Math.min(maxCellW, maxCellH, 50));
+  const mazeSize = cellSize * gs;
+
+  const totalW = cols * mazeSize + (cols - 1) * gapX;
+  const totalH = rows * mazeSize + (rows - 1) * gapY;
+  const startX = (W - totalW) / 2;
+  const startY = headerH + (availH - totalH) / 2;
+
+  const layouts = [];
+  for (let i = 0; i < n; i++) {
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    layouts.push({
+      x: startX + col * (mazeSize + gapX),
+      y: startY + row * (mazeSize + gapY + 18), // +18 for label
+      cellSize,
+      mazeSize
+    });
+  }
+
+  return { layouts, cellSize };
 }
 
-// ── Click Handler ──────────────────────────────────────
+function getButtonZones() {
+  const bw = 80, bh = 36, gap = 10;
+  const y = H - 65;
+  const totalW = bw * 4 + gap * 3;
+  const sx = (W - totalW) / 2;
+  return {
+    undo:  { x: sx, y, w: bw, h: bh },
+    reset: { x: sx + bw + gap, y, w: bw, h: bh },
+    menu:  { x: sx + (bw + gap) * 2, y, w: bw, h: bh },
+    next:  { x: sx + (bw + gap) * 3, y, w: bw, h: bh }
+  };
+}
+
+function isInside(mx, my, zone) {
+  return mx >= zone.x && mx <= zone.x + zone.w && my >= zone.y && my <= zone.y + zone.h;
+}
+
+// ── Click ──────────────────────────────────────────────
+
 function handleClick(cx, cy) {
   if (state === State.MENU) {
-    // Play button
-    if (cy > H * 0.55 && cy < H * 0.55 + 54 && cx > W / 2 - 100 && cx < W / 2 + 100) {
-      startGame();
-    }
-    // Leaderboard button
-    if (cy > H * 0.55 + 70 && cy < H * 0.55 + 124 && cx > W / 2 - 100 && cx < W / 2 + 100) {
-      state = State.LEADERBOARD;
+    const btnY = H * 0.55;
+    if (cx > W / 2 - 110 && cx < W / 2 + 110) {
+      if (cy > btnY && cy < btnY + 50) startGame();
+      if (cy > btnY + 64 && cy < btnY + 114) { state = State.LEADERBOARD; }
     }
     return;
   }
 
-  if (state === State.PLAYING && puzzle) {
-    const choice = getChoiceAt(cx, cy);
-    if (choice >= 0) {
-      selectChoice(choice);
-    }
+  if (state === State.PLAYING) {
+    const zones = getButtonZones();
+    if (isInside(cx, cy, zones.undo)) undo();
+    else if (isInside(cx, cy, zones.reset)) resetLevel();
+    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; }
+    return;
+  }
+
+  if (state === State.WIN) {
+    const zones = getButtonZones();
+    if (isInside(cx, cy, zones.next)) nextLevel();
+    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; }
     return;
   }
 
   if (state === State.GAME_OVER) {
-    // Check "Play Again" button
-    if (cy > H * 0.72 && cy < H * 0.72 + 50 && cx > W / 2 - 90 && cx < W / 2 + 90) {
+    if (cx > W / 2 - 90 && cx < W / 2 + 90 && cy > H * 0.7 && cy < H * 0.7 + 50) {
       state = State.MENU;
     }
     return;
   }
 
   if (state === State.LEADERBOARD) {
-    // Back button
-    if (cy > H - 80 && cy < H - 30 && cx > W / 2 - 80 && cx < W / 2 + 80) {
+    if (cy > H - 70 && cy < H - 24 && cx > W / 2 - 80 && cx < W / 2 + 80) {
       state = State.MENU;
     }
     return;
@@ -130,507 +217,464 @@ function handleClick(cx, cy) {
 }
 
 // ── Game Logic ─────────────────────────────────────────
+
 function startGame() {
-  level = 1;
-  score = 0;
-  lives = 3;
-  streak = 0;
-  bestStreak = 0;
+  levelNum = 1;
+  totalScore = 0;
+  totalStars = 0;
+  lives = 5;
+  loadLevel(levelNum);
+}
+
+function loadLevel(num) {
+  level = generateLevel(num);
+  positions = level.starts.map(s => ({ ...s }));
+  displayPos = positions.map(p => ({ row: p.row, col: p.col }));
+  moveCount = 0;
+  undoStack = [];
+  lastMoveDir = null;
+  animating = false;
   state = State.PLAYING;
-  nextPuzzle();
 }
 
-function nextPuzzle() {
-  puzzle = generatePuzzle(level);
-  selectedChoice = -1;
-  timerStart = performance.now();
-  elapsed = 0;
-}
+function executeMove(dir) {
+  if (!level || animating) return;
 
-function selectChoice(idx) {
-  if (selectedChoice >= 0) return; // Already chose
-  selectedChoice = idx;
+  // Save state for undo
+  undoStack.push(positions.map(p => ({ ...p })));
 
-  const maxTime = getMaxTime(level);
-  const timeTaken = elapsed;
-
-  if (idx === puzzle.correctIndex) {
-    feedbackCorrect = true;
-    streak++;
-    if (streak > bestStreak) bestStreak = streak;
-
-    const baseScore = level * 100;
-    const timeBonus = Math.max(0, Math.floor((maxTime - timeTaken) * level * 5));
-    const streakBonus = streak * 50;
-    score += baseScore + timeBonus + streakBonus;
-
-    spawnParticles(true);
-  } else {
-    feedbackCorrect = false;
-    lives--;
-    streak = 0;
-    spawnParticles(false);
+  // Toggle walls if applicable
+  if (level.hasToggle) {
+    for (let a = 0; a < level.numAgents; a++) {
+      applyToggle(level.grids[a], level.toggleWalls[a], moveCount + 1);
+    }
   }
 
-  state = State.FEEDBACK;
-  feedbackTimer = performance.now();
-}
+  // Compute new positions
+  const newPos = positions.map((p, a) =>
+    moveAgent(p, dir, level.grids[a], level.gridSize, level.portals[a])
+  );
 
-function afterFeedback() {
-  if (lives <= 0) {
-    state = State.GAME_OVER;
-    promptName();
+  // Check if any agent actually moved
+  const anyMoved = newPos.some((np, i) =>
+    np.row !== positions[i].row || np.col !== positions[i].col
+  );
+
+  if (!anyMoved) {
+    undoStack.pop(); // nothing happened, don't count
     return;
   }
-  if (feedbackCorrect) level++;
-  state = State.PLAYING;
-  nextPuzzle();
-}
 
-function promptName() {
-  // Defer to next frame so canvas updates
-  setTimeout(() => {
-    const diff = getDifficultyLabel(level);
-    let name = prompt(`GAME OVER!\nScore: ${score} | Level: ${level} | IQ Estimate: ${diff.iq}\n\nEnter your name for the leaderboard:`);
-    if (name && name.trim()) {
-      addEntry(name.trim(), score, level, diff.iq);
+  // Start animation
+  animFrom = positions.map(p => ({ ...p }));
+  animTo = newPos;
+  positions = newPos;
+  moveCount++;
+  lastMoveDir = dir;
+  animating = true;
+  animStart = performance.now();
+
+  // Move limit: par * 3 moves max, then lose a life
+  const moveLimit = level.par * 3;
+  if (moveCount >= moveLimit && !checkWin(positions, level.targets)) {
+    animating = false;
+    displayPos = positions.map(p => ({ row: p.row, col: p.col }));
+    lives--;
+    if (lives <= 0) {
+      state = State.GAME_OVER;
+      promptName();
+    } else {
+      // Reset level, keep same level number
+      loadLevel(levelNum);
     }
-  }, 100);
+  }
 }
 
-// ── Particles ──────────────────────────────────────────
-function spawnParticles(success) {
-  const { top, choiceSize, startX } = getChoiceLayout();
-  const idx = selectedChoice;
-  const px = startX + idx * (choiceSize + 8) + choiceSize / 2;
-  const py = top + choiceSize / 2;
-  const color = success ? '#3eff8e' : '#ff3e5e';
+function updateAnimation(now) {
+  if (!animating) return;
+  const t = Math.min((now - animStart) / ANIM_DURATION, 1);
+  const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // ease in-out
 
-  for (let i = 0; i < 12; i++) {
-    const angle = (Math.PI * 2 * i) / 12;
-    const speed = 2 + Math.random() * 3;
+  displayPos = animFrom.map((from, i) => ({
+    row: from.row + (animTo[i].row - from.row) * ease,
+    col: from.col + (animTo[i].col - from.col) * ease
+  }));
+
+  if (t >= 1) {
+    animating = false;
+    displayPos = positions.map(p => ({ row: p.row, col: p.col }));
+
+    // Check win
+    if (checkWin(positions, level.targets)) {
+      onWin();
+    }
+  }
+}
+
+function onWin() {
+  const stars = getStars(moveCount, level.par);
+  const levelScore = stars * 100 + Math.max(0, (level.par - moveCount)) * 50 + levelNum * 25;
+  totalScore += levelScore;
+  totalStars += stars;
+  saveLevelResult(levelNum, moveCount, stars);
+  winTime = performance.now();
+  state = State.WIN;
+
+  // Celebration particles
+  for (let i = 0; i < 40; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 4;
     particles.push({
-      x: px, y: py,
+      x: W / 2 + (Math.random() - 0.5) * W * 0.6,
+      y: H * 0.4,
       vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed,
+      vy: Math.sin(angle) * speed - 2,
       life: 1,
-      color,
-      r: 2 + Math.random() * 3
+      color: AGENT_COLORS[Math.floor(Math.random() * level.numAgents)],
+      r: 2 + Math.random() * 4
     });
   }
 }
+
+function nextLevel() {
+  levelNum++;
+  loadLevel(levelNum);
+}
+
+function promptName() {
+  setTimeout(() => {
+    const diff = getDifficulty(levelNum);
+    let name = prompt(
+      `GAME OVER!\nScore: ${totalScore} | Level: ${levelNum} | IQ ~${diff.iq}\n\nEnter your name:`
+    );
+    if (name && name.trim()) {
+      addEntry(name.trim(), totalScore, levelNum, totalStars);
+    }
+  }, 150);
+}
+
+function undo() {
+  if (undoStack.length === 0 || animating) return;
+  positions = undoStack.pop();
+  displayPos = positions.map(p => ({ row: p.row, col: p.col }));
+  moveCount = Math.max(0, moveCount - 1);
+
+  if (level.hasToggle) {
+    for (let a = 0; a < level.numAgents; a++) {
+      applyToggle(level.grids[a], level.toggleWalls[a], moveCount);
+    }
+  }
+}
+
+function resetLevel() {
+  if (animating) return;
+  positions = level.starts.map(s => ({ ...s }));
+  displayPos = positions.map(p => ({ row: p.row, col: p.col }));
+  moveCount = 0;
+  undoStack = [];
+
+  if (level.hasToggle) {
+    for (let a = 0; a < level.numAgents; a++) {
+      applyToggle(level.grids[a], level.toggleWalls[a], 0);
+    }
+  }
+}
+
+// ── Particles ──────────────────────────────────────────
 
 function updateParticles(dt) {
   for (let i = particles.length - 1; i >= 0; i--) {
     const p = particles[i];
     p.x += p.vx;
     p.y += p.vy;
-    p.vy += 0.1;
-    p.life -= dt * 2;
+    p.vy += 0.12;
+    p.life -= dt * 1.2;
     if (p.life <= 0) particles.splice(i, 1);
   }
 }
 
-function drawParticles(ctx) {
+function drawParticles() {
+  const ctx = renderer.ctx;
   for (const p of particles) {
+    ctx.globalAlpha = Math.max(0, p.life);
+    ctx.fillStyle = p.color;
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
-    ctx.fillStyle = p.color;
-    ctx.globalAlpha = p.life;
     ctx.fill();
-    ctx.globalAlpha = 1;
   }
+  ctx.globalAlpha = 1;
 }
 
 // ── Render ─────────────────────────────────────────────
-function drawHeart(ctx, x, y, s, color) {
-  ctx.save();
-  ctx.fillStyle = color;
-  ctx.beginPath();
-  ctx.moveTo(x, y + s * 0.3);
-  ctx.bezierCurveTo(x, y - s * 0.3, x - s, y - s * 0.3, x - s, y + s * 0.1);
-  ctx.bezierCurveTo(x - s, y + s * 0.7, x, y + s * 1.1, x, y + s * 1.3);
-  ctx.bezierCurveTo(x, y + s * 1.1, x + s, y + s * 0.7, x + s, y + s * 0.1);
-  ctx.bezierCurveTo(x + s, y - s * 0.3, x, y - s * 0.3, x, y + s * 0.3);
-  ctx.fill();
-  ctx.restore();
-}
 
-function drawButton(ctx, text, x, y, w, h, hover) {
-  ctx.save();
-  ctx.beginPath();
-  const r = 8;
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-
-  ctx.fillStyle = hover ? 'rgba(240,192,64,0.2)' : 'rgba(255,255,255,0.06)';
-  ctx.fill();
-  ctx.strokeStyle = hover ? '#f0c040' : 'rgba(255,255,255,0.2)';
-  ctx.lineWidth = hover ? 2 : 1;
-  ctx.stroke();
-
-  ctx.fillStyle = hover ? '#f0c040' : '#ccc';
-  ctx.font = 'bold 16px "JetBrains Mono", "Fira Code", monospace';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, x + w / 2, y + h / 2);
-  ctx.restore();
-}
-
-function render() {
+function render(now) {
+  renderer.clear(W, H);
   const ctx = renderer.ctx;
-  renderer.clear();
 
-  // Background
-  ctx.fillStyle = '#08081a';
-  ctx.fillRect(0, 0, W, H);
+  if (state === State.MENU) renderMenu(ctx);
+  else if (state === State.PLAYING || state === State.WIN) renderGame(ctx);
+  else if (state === State.GAME_OVER) renderGameOver(ctx);
+  else if (state === State.LEADERBOARD) renderLeaderboard(ctx);
 
-  // Subtle grid lines in background
-  ctx.strokeStyle = 'rgba(255,255,255,0.015)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i < W; i += 40) {
-    ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, H); ctx.stroke();
-  }
-  for (let i = 0; i < H; i += 40) {
-    ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(W, i); ctx.stroke();
-  }
-
-  if (state === State.MENU) {
-    renderMenu(ctx);
-  } else if (state === State.PLAYING || state === State.FEEDBACK) {
-    renderGame(ctx);
-  } else if (state === State.GAME_OVER) {
-    renderGameOver(ctx);
-  } else if (state === State.LEADERBOARD) {
-    renderLeaderboard(ctx);
-  }
-
-  drawParticles(ctx);
+  drawParticles();
 }
 
 function renderMenu(ctx) {
   // Title
-  ctx.fillStyle = '#f0c040';
-  ctx.font = 'bold 56px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('CORTEX', W / 2, H * 0.25);
+  renderer.text('HIVEMIND', W / 2, H * 0.2, { color: '#f0c040', size: 48, bold: true });
+  renderer.text('One Mind. Many Bodies. Zero Margin for Error.', W / 2, H * 0.2 + 36, {
+    color: 'rgba(255,255,255,0.4)', size: 11
+  });
 
-  // Subtitle
-  ctx.fillStyle = 'rgba(255,255,255,0.5)';
-  ctx.font = '14px "JetBrains Mono", monospace';
-  ctx.fillText('Pattern Recognition for Elite Minds', W / 2, H * 0.25 + 35);
-
-  // Animated symbol (pulsing concentric shapes)
-  const pulse = 0.8 + Math.sin(animFrame * 0.03) * 0.2;
-  ctx.save();
-  ctx.translate(W / 2, H * 0.42);
-  ctx.scale(pulse, pulse);
-  // Outer ring
-  ctx.strokeStyle = 'rgba(240,192,64,0.2)';
-  ctx.lineWidth = 2;
-  ctx.beginPath(); ctx.arc(0, 0, 40, 0, Math.PI * 2); ctx.stroke();
-  // Inner shapes
-  ctx.strokeStyle = 'rgba(240,192,64,0.3)';
-  ctx.lineWidth = 1.5;
-  for (let i = 0; i < 6; i++) {
-    const a = (Math.PI * 2 * i) / 6 + animFrame * 0.01;
-    const r = 22;
-    ctx.beginPath();
-    ctx.arc(Math.cos(a) * r, Math.sin(a) * r, 8, 0, Math.PI * 2);
-    ctx.stroke();
+  // Animated connected nodes
+  const cx = W / 2, cy = H * 0.38;
+  const t = performance.now() / 1000;
+  const nodes = [];
+  for (let i = 0; i < 5; i++) {
+    const a = (Math.PI * 2 * i) / 5 + t * 0.3;
+    const r = 35 + Math.sin(t * 0.8 + i) * 8;
+    nodes.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
   }
-  // Center dot
-  ctx.beginPath(); ctx.arc(0, 0, 5, 0, Math.PI * 2);
-  ctx.fillStyle = 'rgba(240,192,64,0.4)';
+
+  // Connections
+  ctx.lineWidth = 1;
+  for (let i = 0; i < nodes.length; i++) {
+    for (let j = i + 1; j < nodes.length; j++) {
+      ctx.strokeStyle = `rgba(240,192,64,${0.08 + Math.sin(t + i + j) * 0.04})`;
+      ctx.beginPath();
+      ctx.moveTo(nodes[i].x, nodes[i].y);
+      ctx.lineTo(nodes[j].x, nodes[j].y);
+      ctx.stroke();
+    }
+  }
+
+  // Nodes
+  for (let i = 0; i < nodes.length; i++) {
+    ctx.beginPath();
+    ctx.arc(nodes[i].x, nodes[i].y, 6, 0, Math.PI * 2);
+    ctx.fillStyle = AGENT_COLORS[i];
+    ctx.fill();
+  }
+
+  // Center node
+  ctx.beginPath();
+  ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+  ctx.fillStyle = '#f0c040';
   ctx.fill();
-  ctx.restore();
 
   // Buttons
-  const playHover = mouseX > W / 2 - 100 && mouseX < W / 2 + 100 &&
-                    mouseY > H * 0.55 && mouseY < H * 0.55 + 54;
-  drawButton(ctx, 'PLAY', W / 2 - 100, H * 0.55, 200, 50, playHover);
+  const btnY = H * 0.55;
+  const playH = isInside(mouseX, mouseY, { x: W / 2 - 110, y: btnY, w: 220, h: 50 });
+  renderer.drawButton(W / 2 - 110, btnY, 220, 50, 'PLAY', playH, true);
 
-  const lbHover = mouseX > W / 2 - 100 && mouseX < W / 2 + 100 &&
-                  mouseY > H * 0.55 + 70 && mouseY < H * 0.55 + 124;
-  drawButton(ctx, 'LEADERBOARD', W / 2 - 100, H * 0.55 + 70, 200, 50, lbHover);
+  const lbH = isInside(mouseX, mouseY, { x: W / 2 - 110, y: btnY + 64, w: 220, h: 50 });
+  renderer.drawButton(W / 2 - 110, btnY + 64, 220, 50, 'LEADERBOARD', lbH);
 
-  // Instructions
-  ctx.fillStyle = 'rgba(255,255,255,0.3)';
-  ctx.font = '12px "JetBrains Mono", monospace';
-  ctx.fillText('Deduce the hidden rules. Find the missing cell.', W / 2, H * 0.82);
-  ctx.fillText('Each property follows a pattern across rows & columns.', W / 2, H * 0.82 + 20);
-  ctx.fillText('More dimensions. Less time. Can you reach 200 IQ?', W / 2, H * 0.82 + 40);
+  // How to play
+  const lines = [
+    'Arrow keys / WASD / Swipe to move',
+    'ALL agents move together, different mazes',
+    'Get every agent to its matching target',
+    'Z = Undo  |  R = Reset'
+  ];
+  lines.forEach((l, i) => {
+    renderer.text(l, W / 2, H * 0.78 + i * 18, { color: 'rgba(255,255,255,0.25)', size: 11 });
+  });
 }
 
 function renderGame(ctx) {
-  if (state === State.PLAYING) {
-    elapsed = (performance.now() - timerStart) / 1000;
+  const diff = getDifficulty(levelNum);
+  const { layouts, cellSize } = getMazeLayout();
+
+  // ── Header ────
+  renderer.text('HIVEMIND', 16, 24, { color: '#f0c040', size: 18, bold: true, align: 'left' });
+  renderer.text(`Level ${levelNum}`, W - 16, 18, { color: 'rgba(255,255,255,0.6)', size: 12, align: 'right' });
+  renderer.text(`${diff.name} (IQ ~${diff.iq})`, W - 16, 34, {
+    color: diff.iq === '200+' ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 11, align: 'right'
+  });
+
+  // Moves, par & limit
+  const moveLimit = level.par * 3;
+  const movePct = moveCount / moveLimit;
+  const moveColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : 'rgba(255,255,255,0.6)';
+  renderer.text(`Moves: ${moveCount} / ${moveLimit}`, 16, 48, {
+    color: moveColor, size: 12, align: 'left'
+  });
+  renderer.text(`Par: ${level.par}`, 16, 64, {
+    color: 'rgba(255,255,255,0.35)', size: 11, align: 'left'
+  });
+
+  // Lives
+  for (let i = 0; i < 5; i++) {
+    const hx = W - 20 - (4 - i) * 18;
+    drawDiamond(ctx, hx, 54, 6, i < lives ? '#f0c040' : 'rgba(255,255,255,0.08)');
   }
 
-  const maxTime = getMaxTime(level);
-  const diff = getDifficultyLabel(level);
+  // Score
+  renderer.text(`Score: ${totalScore}`, W / 2, 82, { color: 'rgba(255,255,255,0.4)', size: 11 });
 
-  // ── Header ───
-  ctx.fillStyle = '#f0c040';
-  ctx.font = 'bold 22px "JetBrains Mono", monospace';
-  ctx.textAlign = 'left';
-  ctx.fillText('CORTEX', 16, 30);
-
-  ctx.font = '13px "JetBrains Mono", monospace';
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.textAlign = 'right';
-  ctx.fillText(`Level ${level}`, W - 16, 20);
-  ctx.fillStyle = diff.iq === '200+' ? '#f0c040' : 'rgba(255,255,255,0.4)';
-  ctx.fillText(`IQ ~${diff.iq} | ${diff.name}`, W - 16, 38);
-
-  // Score & lives
-  ctx.textAlign = 'left';
-  ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  ctx.font = '13px "JetBrains Mono", monospace';
-  ctx.fillText(`Score: ${score}`, 16, 55);
-
-  // Streak
-  if (streak > 0) {
-    ctx.fillStyle = '#f0c040';
-    ctx.fillText(`Streak: ${streak}x`, 16, 75);
+  // Features indicator
+  const features = [];
+  if (level.hasPortals) features.push('PORTALS');
+  if (level.hasToggle) features.push('TOGGLE');
+  if (features.length) {
+    renderer.text(features.join(' + '), W / 2, 68, { color: '#ff8f00', size: 10 });
   }
 
-  // Lives (drawn hearts for cross-platform Canvas support)
-  for (let i = 0; i < 3; i++) {
-    const hx = W - 26 - (2 - i) * 22;
-    const hy = 50;
-    drawHeart(ctx, hx, hy, 8, i < lives ? '#ff3e5e' : 'rgba(255,255,255,0.15)');
+  // ── Mazes ─────
+  for (let a = 0; a < level.numAgents; a++) {
+    const lay = layouts[a];
+    if (!lay) continue;
+
+    const agentSolved = positions[a].row === level.targets[a].row &&
+                        positions[a].col === level.targets[a].col;
+
+    renderer.drawMaze({
+      grid: level.grids[a],
+      gridSize: level.gridSize,
+      x: lay.x,
+      y: lay.y,
+      cellSize: lay.cellSize,
+      agentPos: positions[a],
+      agentDisplayPos: displayPos[a],
+      targetPos: level.targets[a],
+      colorIdx: a,
+      portals: level.portals[a],
+      toggleWalls: level.hasToggle ? level.toggleWalls[a] : null,
+      moveCount,
+      solved: agentSolved,
+      label: AGENT_NAMES[a]
+    });
   }
 
-  // Timer bar
-  const timerFrac = Math.min(elapsed / maxTime, 1);
-  const barY = 92;
-  const barW = W - 32;
-  ctx.fillStyle = 'rgba(255,255,255,0.05)';
-  ctx.fillRect(16, barY, barW, 6);
-  const timerColor = timerFrac > 0.8 ? '#ff3e5e' : timerFrac > 0.5 ? '#f0c040' : '#3eff8e';
-  ctx.fillStyle = timerColor;
-  ctx.fillRect(16, barY, barW * (1 - timerFrac), 6);
+  // ── Buttons ───
+  const zones = getButtonZones();
 
-  ctx.fillStyle = 'rgba(255,255,255,0.4)';
-  ctx.font = '11px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText(`${Math.max(0, Math.ceil(maxTime - elapsed))}s`, W / 2, barY + 20);
+  if (state === State.WIN) {
+    // Win overlay
+    const stars = getStars(moveCount, level.par);
+    renderer.text('SOLVED!', W / 2, H - 110, { color: '#3eff8e', size: 22, bold: true });
+    renderer.drawStars(W / 2, H - 85, stars);
 
-  // Active properties hint
-  if (puzzle) {
-    ctx.fillStyle = 'rgba(255,255,255,0.2)';
-    ctx.font = '10px "JetBrains Mono", monospace';
-    ctx.textAlign = 'center';
-    const propNames = puzzle.activeProps.map(p => PROP_LABELS[p]).join(' + ');
-    ctx.fillText(`Active: ${propNames}`, W / 2, barY + 35);
+    const nextH = isInside(mouseX, mouseY, zones.next);
+    renderer.drawButton(zones.next.x, zones.next.y, zones.next.w, zones.next.h, 'NEXT', nextH, true);
+    const menuH = isInside(mouseX, mouseY, zones.menu);
+    renderer.drawButton(zones.menu.x, zones.menu.y, zones.menu.w, zones.menu.h, 'MENU', menuH);
+  } else {
+    const undoH = isInside(mouseX, mouseY, zones.undo);
+    renderer.drawButton(zones.undo.x, zones.undo.y, zones.undo.w, zones.undo.h,
+      `UNDO (${undoStack.length})`, undoH);
+
+    const resetH = isInside(mouseX, mouseY, zones.reset);
+    renderer.drawButton(zones.reset.x, zones.reset.y, zones.reset.w, zones.reset.h, 'RESET', resetH);
+
+    const menuH = isInside(mouseX, mouseY, zones.menu);
+    renderer.drawButton(zones.menu.x, zones.menu.y, zones.menu.w, zones.menu.h, 'MENU', menuH);
   }
 
-  // ── Grid ─────
-  if (!puzzle) return;
-  const { gx, gy, cellSize, gap } = getGridLayout();
-
-  for (let r = 0; r < 3; r++) {
-    for (let c = 0; c < 3; c++) {
-      const x = gx + c * (cellSize + gap);
-      const y = gy + r * (cellSize + gap);
-
-      if (r === 2 && c === 2) {
-        if (state === State.FEEDBACK) {
-          // Show correct answer
-          renderer.drawCell(puzzle.answer, x, y, cellSize, cellSize, {
-            correct: feedbackCorrect,
-            wrong: !feedbackCorrect
-          });
-        } else {
-          renderer.drawQuestionMark(x, y, cellSize, cellSize);
-        }
-      } else {
-        renderer.drawCell(puzzle.grid[r][c], x, y, cellSize, cellSize);
-      }
-    }
-  }
-
-  // ── Choices ───
-  const { top, choiceSize, startX } = getChoiceLayout();
-  const currentHover = state === State.PLAYING ? getChoiceAt(mouseX, mouseY) : -1;
-
-  ctx.fillStyle = 'rgba(255,255,255,0.3)';
-  ctx.font = '12px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('Select the missing piece:', W / 2, top - 12);
-
-  for (let i = 0; i < 4; i++) {
-    const x = startX + i * (choiceSize + 8);
-    const opts = {};
-
-    if (state === State.FEEDBACK) {
-      if (i === puzzle.correctIndex) opts.correct = true;
-      if (i === selectedChoice && !feedbackCorrect) opts.wrong = true;
-    } else {
-      if (i === currentHover) opts.highlight = true;
-    }
-
-    renderer.drawCell(puzzle.choices[i], x, top, choiceSize, choiceSize, opts);
-
-    // Choice label
-    ctx.fillStyle = 'rgba(255,255,255,0.3)';
-    ctx.font = '11px "JetBrains Mono", monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText(String.fromCharCode(65 + i), x + choiceSize / 2, top + choiceSize + 16);
-  }
-
-  // ── Feedback text ───
-  if (state === State.FEEDBACK) {
-    ctx.textAlign = 'center';
-    ctx.font = 'bold 18px "JetBrains Mono", monospace';
-    if (feedbackCorrect) {
-      ctx.fillStyle = '#3eff8e';
-      ctx.fillText('CORRECT', W / 2, top + choiceSize + 50);
-    } else {
-      ctx.fillStyle = '#ff3e5e';
-      ctx.fillText(lives > 0 ? 'WRONG' : 'GAME OVER', W / 2, top + choiceSize + 50);
-    }
-  }
-
-  // Auto-timeout: wrong answer if time runs out
-  if (state === State.PLAYING && elapsed >= maxTime) {
-    selectedChoice = -1;
-    feedbackCorrect = false;
-    lives--;
-    streak = 0;
-    state = State.FEEDBACK;
-    feedbackTimer = performance.now();
+  // Direction hint
+  if (lastMoveDir && state === State.PLAYING) {
+    const arrows = { up: '\u2191', down: '\u2193', left: '\u2190', right: '\u2192' };
+    renderer.text(arrows[lastMoveDir], W / 2, H - 25, { color: 'rgba(255,255,255,0.15)', size: 20 });
   }
 }
 
 function renderGameOver(ctx) {
-  const diff = getDifficultyLabel(level);
+  renderer.text('GAME OVER', W / 2, H * 0.2, { color: '#ff3e5e', size: 36, bold: true });
 
-  ctx.fillStyle = '#f0c040';
-  ctx.font = 'bold 36px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('GAME OVER', W / 2, H * 0.2);
-
-  ctx.fillStyle = 'rgba(255,255,255,0.6)';
-  ctx.font = '16px "JetBrains Mono", monospace';
-
-  const stats = [
-    `Score: ${score}`,
-    `Max Level: ${level}`,
-    `Best Streak: ${bestStreak}x`,
+  const diff = getDifficulty(levelNum);
+  const lines = [
+    `Reached Level ${levelNum}`,
+    `Total Score: ${totalScore}`,
+    `Stars Earned: ${totalStars}`,
     `IQ Estimate: ~${diff.iq}`,
     `Rating: ${diff.name}`
   ];
 
-  stats.forEach((s, i) => {
-    ctx.fillStyle = i === 3 ? '#f0c040' : 'rgba(255,255,255,0.6)';
-    ctx.fillText(s, W / 2, H * 0.35 + i * 30);
+  lines.forEach((l, i) => {
+    const c = i === 3 ? '#f0c040' : 'rgba(255,255,255,0.6)';
+    renderer.text(l, W / 2, H * 0.35 + i * 28, { color: c, size: 15 });
   });
 
-  // Rank
-  const rank = getRank(score);
-  ctx.fillStyle = rank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.5)';
-  ctx.font = '14px "JetBrains Mono", monospace';
-  ctx.fillText(`Leaderboard Rank: #${rank}`, W / 2, H * 0.35 + stats.length * 30 + 20);
+  const rank = getRank(totalScore);
+  renderer.text(`Leaderboard: #${rank}`, W / 2, H * 0.35 + lines.length * 28 + 15, {
+    color: rank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.4)', size: 13
+  });
 
-  // Play Again button
-  const btnHover = mouseX > W / 2 - 90 && mouseX < W / 2 + 90 &&
-                   mouseY > H * 0.72 && mouseY < H * 0.72 + 50;
-  drawButton(ctx, 'PLAY AGAIN', W / 2 - 90, H * 0.72, 180, 50, btnHover);
+  const bh = isInside(mouseX, mouseY, { x: W / 2 - 90, y: H * 0.7, w: 180, h: 50 });
+  renderer.drawButton(W / 2 - 90, H * 0.7, 180, 50, 'MAIN MENU', bh, true);
 }
 
 function renderLeaderboard(ctx) {
-  ctx.fillStyle = '#f0c040';
-  ctx.font = 'bold 28px "JetBrains Mono", monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('LEADERBOARD', W / 2, 50);
+  renderer.text('LEADERBOARD', W / 2, 45, { color: '#f0c040', size: 26, bold: true });
 
   const board = getLeaderboard();
 
   if (board.length === 0) {
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = '14px "JetBrains Mono", monospace';
-    ctx.fillText('No entries yet. Play to get on the board!', W / 2, 120);
+    renderer.text('No entries yet. Be the first!', W / 2, 120, {
+      color: 'rgba(255,255,255,0.4)', size: 13
+    });
   } else {
     // Header
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    ctx.font = '11px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '10px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
-    ctx.fillText('#', 20, 90);
-    ctx.fillText('Name', 50, 90);
-    ctx.fillText('Score', W * 0.45, 90);
-    ctx.fillText('Lvl', W * 0.65, 90);
-    ctx.fillText('IQ', W * 0.78, 90);
+    ctx.fillText('#', 24, 85);
+    ctx.fillText('Name', 50, 85);
+    ctx.fillText('Score', W * 0.5, 85);
+    ctx.fillText('Lvl', W * 0.7, 85);
+    ctx.fillText('Stars', W * 0.82, 85);
 
-    // Divider
-    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-    ctx.beginPath();
-    ctx.moveTo(20, 98);
-    ctx.lineTo(W - 20, 98);
-    ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+    ctx.beginPath(); ctx.moveTo(24, 92); ctx.lineTo(W - 24, 92); ctx.stroke();
 
-    // Entries
-    const maxShow = Math.min(board.length, 15);
-    for (let i = 0; i < maxShow; i++) {
+    const max = Math.min(board.length, 12);
+    for (let i = 0; i < max; i++) {
       const e = board[i];
-      const y = 118 + i * 28;
-      const isTop3 = i < 3;
-
-      ctx.font = `${isTop3 ? 'bold ' : ''}13px "JetBrains Mono", monospace`;
-      ctx.fillStyle = isTop3 ? '#f0c040' : 'rgba(255,255,255,0.6)';
-
+      const y = 112 + i * 26;
+      const top3 = i < 3;
+      ctx.font = `${top3 ? 'bold ' : ''}12px "JetBrains Mono", monospace`;
+      ctx.fillStyle = top3 ? '#f0c040' : 'rgba(255,255,255,0.55)';
       ctx.textAlign = 'left';
-      ctx.fillText(`${i + 1}`, 20, y);
+      ctx.fillText(`${i + 1}`, 24, y);
       ctx.fillText(e.name, 50, y);
-      ctx.fillText(`${e.score}`, W * 0.45, y);
-      ctx.fillText(`${e.maxLevel}`, W * 0.65, y);
-      ctx.fillText(`${e.iq}`, W * 0.78, y);
+      ctx.fillText(`${e.score}`, W * 0.5, y);
+      ctx.fillText(`${e.level}`, W * 0.7, y);
+      ctx.fillText(`${'★'.repeat(Math.min(e.stars, 99))}`, W * 0.82, y);
     }
   }
 
-  // Back button
-  const btnHover = mouseX > W / 2 - 80 && mouseX < W / 2 + 80 &&
-                   mouseY > H - 80 && mouseY < H - 30;
-  drawButton(ctx, 'BACK', W / 2 - 80, H - 80, 160, 45, btnHover);
+  const bh = isInside(mouseX, mouseY, { x: W / 2 - 80, y: H - 70, w: 160, h: 45 });
+  renderer.drawButton(W / 2 - 80, H - 70, 160, 45, 'BACK', bh);
+}
+
+// ── Helpers ────────────────────────────────────────────
+
+function drawDiamond(ctx, x, y, s, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x, y - s);
+  ctx.lineTo(x + s * 0.7, y);
+  ctx.lineTo(x, y + s);
+  ctx.lineTo(x - s * 0.7, y);
+  ctx.closePath();
+  ctx.fill();
 }
 
 // ── Game Loop ──────────────────────────────────────────
+
 let lastTime = performance.now();
 
-function gameLoop(now) {
+function loop(now) {
   const dt = (now - lastTime) / 1000;
   lastTime = now;
-  animFrame++;
 
-  // Feedback auto-advance
-  if (state === State.FEEDBACK && now - feedbackTimer > 1200) {
-    afterFeedback();
-  }
-
+  renderer.tick(dt);
+  updateAnimation(now);
   updateParticles(dt);
-  render();
-  requestAnimationFrame(gameLoop);
+  render(now);
+
+  requestAnimationFrame(loop);
 }
 
-// Keyboard support
-document.addEventListener('keydown', e => {
-  if (state === State.PLAYING && puzzle) {
-    const keyMap = { '1': 0, '2': 1, '3': 2, '4': 3, 'a': 0, 'b': 1, 'c': 2, 'd': 3 };
-    const idx = keyMap[e.key.toLowerCase()];
-    if (idx !== undefined) selectChoice(idx);
-  }
-  if (state === State.MENU && (e.key === 'Enter' || e.key === ' ')) {
-    startGame();
-  }
-});
-
-requestAnimationFrame(gameLoop);
+requestAnimationFrame(loop);
