@@ -10,17 +10,18 @@ import {
   getLeaderboard, addEntry, getRank,
   saveLevelResult, getMaxUnlockedLevel, getTotalStars
 } from './leaderboard.js';
+import * as audio from './audio.js';
 
 // ── Constants ──────────────────────────────────────────
 const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4 };
-const ANIM_DURATION = 120; // ms
+const ANIM_DURATION = 130; // ms
 
 // ── State ──────────────────────────────────────────────
 let state = State.MENU;
-let level = null;        // current level data
+let level = null;
 let levelNum = 1;
-let positions = [];      // current agent positions [{row,col}, ...]
-let displayPos = [];     // animated display positions [{row,col}, ...]
+let positions = [];
+let displayPos = [];
 let moveCount = 0;
 let undoStack = [];
 let totalScore = 0;
@@ -35,17 +36,19 @@ let winTime = 0;
 let particles = [];
 let mouseX = 0, mouseY = 0;
 
-// Swipe tracking
-let touchStartX = 0, touchStartY = 0;
-let touchStartTime = 0;
+// Swipe
+let touchStartX = 0, touchStartY = 0, touchStartTime = 0;
 
-// ── Canvas ─────────────────────────────────────────────
+// Track which agents just landed on target (for per-agent sound)
+let prevOnTarget = [];
+
+// ── Canvas — FULL WIDTH ────────────────────────────────
 const canvas = document.getElementById('game');
 const renderer = new Renderer(canvas);
 let W, H;
 
 function resize() {
-  W = Math.min(window.innerWidth, 650);
+  W = window.innerWidth;   // full width — no cap
   H = window.innerHeight;
   renderer.resize(W, H);
 }
@@ -55,6 +58,8 @@ resize();
 // ── Input ──────────────────────────────────────────────
 
 document.addEventListener('keydown', e => {
+  if (e.key === 'm' || e.key === 'M') { audio.toggleMute(); return; }
+
   if (state === State.PLAYING && !animating) {
     const map = {
       ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
@@ -62,11 +67,11 @@ document.addEventListener('keydown', e => {
       W: 'up', S: 'down', A: 'left', D: 'right'
     };
     if (map[e.key]) { e.preventDefault(); executeMove(map[e.key]); }
-    if (e.key === 'z' || e.key === 'Z') undo();
-    if (e.key === 'r' || e.key === 'R') resetLevel();
+    if (e.key === 'z' || e.key === 'Z') { undo(); audio.playUndo(); }
+    if (e.key === 'r' || e.key === 'R') { resetLevel(); audio.playReset(); }
   }
-  if (state === State.MENU && (e.key === 'Enter' || e.key === ' ')) startGame();
-  if (state === State.WIN && (e.key === 'Enter' || e.key === ' ')) nextLevel();
+  if (state === State.MENU && (e.key === 'Enter' || e.key === ' ')) { startGame(); audio.playClick(); }
+  if (state === State.WIN && (e.key === 'Enter' || e.key === ' ')) { nextLevel(); audio.playClick(); }
 });
 
 canvas.addEventListener('mousemove', e => {
@@ -101,15 +106,10 @@ canvas.addEventListener('touchend', e => {
   const dt = performance.now() - touchStartTime;
 
   if (dist < 15 && dt < 300) {
-    // Tap
     handleClick(endX, endY);
   } else if (dist > 30 && state === State.PLAYING && !animating) {
-    // Swipe
-    if (Math.abs(dx) > Math.abs(dy)) {
-      executeMove(dx > 0 ? 'right' : 'left');
-    } else {
-      executeMove(dy > 0 ? 'down' : 'up');
-    }
+    if (Math.abs(dx) > Math.abs(dy)) executeMove(dx > 0 ? 'right' : 'left');
+    else executeMove(dy > 0 ? 'down' : 'up');
   }
 }, { passive: true });
 
@@ -120,8 +120,8 @@ function getMazeLayout() {
   const n = level.numAgents;
   const gs = level.gridSize;
   const headerH = 100;
-  const footerH = 120;
-  const availW = W - 32;
+  const footerH = 130;
+  const availW = W - 60;
   const availH = H - headerH - footerH;
 
   let cols, rows;
@@ -130,15 +130,15 @@ function getMazeLayout() {
   else if (n <= 4) { cols = 2; rows = 2; }
   else { cols = 3; rows = 2; }
 
-  const gapX = 16;
-  const gapY = 30;
+  const gapX = Math.min(40, W * 0.03);
+  const gapY = 36;
   const maxCellW = (availW - (cols - 1) * gapX) / (cols * gs);
   const maxCellH = (availH - (rows - 1) * gapY) / (rows * gs);
-  const cellSize = Math.floor(Math.min(maxCellW, maxCellH, 50));
+  const cellSize = Math.floor(Math.min(maxCellW, maxCellH, 70));
   const mazeSize = cellSize * gs;
 
   const totalW = cols * mazeSize + (cols - 1) * gapX;
-  const totalH = rows * mazeSize + (rows - 1) * gapY;
+  const totalH = rows * (mazeSize + 22) + (rows - 1) * gapY;
   const startX = (W - totalW) / 2;
   const startY = headerH + (availH - totalH) / 2;
 
@@ -148,7 +148,7 @@ function getMazeLayout() {
     const row = Math.floor(i / cols);
     layouts.push({
       x: startX + col * (mazeSize + gapX),
-      y: startY + row * (mazeSize + gapY + 18), // +18 for label
+      y: startY + row * (mazeSize + gapY + 22),
       cellSize,
       mazeSize
     });
@@ -158,8 +158,8 @@ function getMazeLayout() {
 }
 
 function getButtonZones() {
-  const bw = 80, bh = 36, gap = 10;
-  const y = H - 65;
+  const bw = 100, bh = 40, gap = 14;
+  const y = H - 72;
   const totalW = bw * 4 + gap * 3;
   const sx = (W - totalW) / 2;
   return {
@@ -170,6 +170,10 @@ function getButtonZones() {
   };
 }
 
+function getMuteZone() {
+  return { x: W - 50, y: 6, w: 36, h: 26 };
+}
+
 function isInside(mx, my, zone) {
   return mx >= zone.x && mx <= zone.x + zone.w && my >= zone.y && my <= zone.y + zone.h;
 }
@@ -177,40 +181,47 @@ function isInside(mx, my, zone) {
 // ── Click ──────────────────────────────────────────────
 
 function handleClick(cx, cy) {
+  // Mute button (global)
+  if (isInside(cx, cy, getMuteZone())) {
+    audio.toggleMute();
+    audio.playClick();
+    return;
+  }
+
   if (state === State.MENU) {
     const btnY = H * 0.55;
-    if (cx > W / 2 - 110 && cx < W / 2 + 110) {
-      if (cy > btnY && cy < btnY + 50) startGame();
-      if (cy > btnY + 64 && cy < btnY + 114) { state = State.LEADERBOARD; }
+    if (cx > W / 2 - 120 && cx < W / 2 + 120) {
+      if (cy > btnY && cy < btnY + 54) { startGame(); audio.playClick(); }
+      if (cy > btnY + 68 && cy < btnY + 122) { state = State.LEADERBOARD; audio.playClick(); }
     }
     return;
   }
 
   if (state === State.PLAYING) {
     const zones = getButtonZones();
-    if (isInside(cx, cy, zones.undo)) undo();
-    else if (isInside(cx, cy, zones.reset)) resetLevel();
-    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; }
+    if (isInside(cx, cy, zones.undo)) { undo(); audio.playUndo(); }
+    else if (isInside(cx, cy, zones.reset)) { resetLevel(); audio.playReset(); }
+    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; audio.playClick(); }
     return;
   }
 
   if (state === State.WIN) {
     const zones = getButtonZones();
-    if (isInside(cx, cy, zones.next)) nextLevel();
-    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; }
+    if (isInside(cx, cy, zones.next)) { nextLevel(); audio.playClick(); }
+    else if (isInside(cx, cy, zones.menu)) { state = State.MENU; audio.playClick(); }
     return;
   }
 
   if (state === State.GAME_OVER) {
-    if (cx > W / 2 - 90 && cx < W / 2 + 90 && cy > H * 0.7 && cy < H * 0.7 + 50) {
-      state = State.MENU;
+    if (cx > W / 2 - 100 && cx < W / 2 + 100 && cy > H * 0.7 && cy < H * 0.7 + 54) {
+      state = State.MENU; audio.playClick();
     }
     return;
   }
 
   if (state === State.LEADERBOARD) {
-    if (cy > H - 70 && cy < H - 24 && cx > W / 2 - 80 && cx < W / 2 + 80) {
-      state = State.MENU;
+    if (cy > H - 76 && cy < H - 26 && cx > W / 2 - 90 && cx < W / 2 + 90) {
+      state = State.MENU; audio.playClick();
     }
     return;
   }
@@ -234,38 +245,52 @@ function loadLevel(num) {
   undoStack = [];
   lastMoveDir = null;
   animating = false;
+  prevOnTarget = positions.map((p, i) =>
+    p.row === level.targets[i].row && p.col === level.targets[i].col
+  );
+  renderer.clearTrails();
   state = State.PLAYING;
+  audio.playLevelStart();
 }
 
 function executeMove(dir) {
   if (!level || animating) return;
 
-  // Save state for undo
   undoStack.push(positions.map(p => ({ ...p })));
 
-  // Toggle walls if applicable
   if (level.hasToggle) {
     for (let a = 0; a < level.numAgents; a++) {
       applyToggle(level.grids[a], level.toggleWalls[a], moveCount + 1);
     }
   }
 
-  // Compute new positions
   const newPos = positions.map((p, a) =>
     moveAgent(p, dir, level.grids[a], level.gridSize, level.portals[a])
   );
 
-  // Check if any agent actually moved
   const anyMoved = newPos.some((np, i) =>
     np.row !== positions[i].row || np.col !== positions[i].col
   );
 
   if (!anyMoved) {
-    undoStack.pop(); // nothing happened, don't count
+    undoStack.pop();
+    audio.playBlocked();
+    renderer.shake(4);
     return;
   }
 
-  // Start animation
+  // Check for portal usage
+  const usedPortal = newPos.some((np, a) => {
+    const portals = level.portals[a];
+    if (!portals || portals.length === 0) return false;
+    for (const p of portals) {
+      const moved = moveAgent(positions[a], dir, level.grids[a], level.gridSize, []);
+      if ((moved.row !== np.row || moved.col !== np.col)) return true;
+    }
+    return false;
+  });
+  if (usedPortal) audio.playPortal();
+
   animFrom = positions.map(p => ({ ...p }));
   animTo = newPos;
   positions = newPos;
@@ -274,17 +299,21 @@ function executeMove(dir) {
   animating = true;
   animStart = performance.now();
 
-  // Move limit: par * 3 moves max, then lose a life
+  audio.playMove();
+
+  // Move limit check
   const moveLimit = level.par * 3;
   if (moveCount >= moveLimit && !checkWin(positions, level.targets)) {
     animating = false;
     displayPos = positions.map(p => ({ row: p.row, col: p.col }));
     lives--;
+    audio.playLoseLife();
+    renderer.shake(12);
     if (lives <= 0) {
       state = State.GAME_OVER;
+      audio.playGameOver();
       promptName();
     } else {
-      // Reset level, keep same level number
       loadLevel(levelNum);
     }
   }
@@ -293,7 +322,7 @@ function executeMove(dir) {
 function updateAnimation(now) {
   if (!animating) return;
   const t = Math.min((now - animStart) / ANIM_DURATION, 1);
-  const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2; // ease in-out
+  const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 
   displayPos = animFrom.map((from, i) => ({
     row: from.row + (animTo[i].row - from.row) * ease,
@@ -304,7 +333,32 @@ function updateAnimation(now) {
     animating = false;
     displayPos = positions.map(p => ({ row: p.row, col: p.col }));
 
-    // Check win
+    // Check per-agent target landing (for sound)
+    const nowOnTarget = positions.map((p, i) =>
+      p.row === level.targets[i].row && p.col === level.targets[i].col
+    );
+    for (let i = 0; i < nowOnTarget.length; i++) {
+      if (nowOnTarget[i] && !prevOnTarget[i]) {
+        audio.playAgentLand();
+        // Spawn small burst at that agent
+        const { layouts } = getMazeLayout();
+        if (layouts[i]) {
+          const lay = layouts[i];
+          const px = lay.x + positions[i].col * lay.cellSize + lay.cellSize / 2;
+          const py = lay.y + positions[i].row * lay.cellSize + lay.cellSize / 2;
+          for (let j = 0; j < 8; j++) {
+            const a = (Math.PI * 2 * j) / 8;
+            particles.push({
+              x: px, y: py,
+              vx: Math.cos(a) * 2.5, vy: Math.sin(a) * 2.5,
+              life: 1, color: AGENT_COLORS[i], r: 3
+            });
+          }
+        }
+      }
+    }
+    prevOnTarget = nowOnTarget;
+
     if (checkWin(positions, level.targets)) {
       onWin();
     }
@@ -320,18 +374,20 @@ function onWin() {
   winTime = performance.now();
   state = State.WIN;
 
-  // Celebration particles
-  for (let i = 0; i < 40; i++) {
+  audio.playWin();
+
+  // Big celebration particles
+  for (let i = 0; i < 60; i++) {
     const angle = Math.random() * Math.PI * 2;
-    const speed = 2 + Math.random() * 4;
+    const speed = 2 + Math.random() * 5;
     particles.push({
-      x: W / 2 + (Math.random() - 0.5) * W * 0.6,
-      y: H * 0.4,
+      x: W / 2 + (Math.random() - 0.5) * W * 0.5,
+      y: H * 0.35 + (Math.random() - 0.5) * 100,
       vx: Math.cos(angle) * speed,
-      vy: Math.sin(angle) * speed - 2,
+      vy: Math.sin(angle) * speed - 3,
       life: 1,
       color: AGENT_COLORS[Math.floor(Math.random() * level.numAgents)],
-      r: 2 + Math.random() * 4
+      r: 2 + Math.random() * 5
     });
   }
 }
@@ -350,7 +406,7 @@ function promptName() {
     if (name && name.trim()) {
       addEntry(name.trim(), totalScore, levelNum, totalStars);
     }
-  }, 150);
+  }, 200);
 }
 
 function undo() {
@@ -358,6 +414,9 @@ function undo() {
   positions = undoStack.pop();
   displayPos = positions.map(p => ({ row: p.row, col: p.col }));
   moveCount = Math.max(0, moveCount - 1);
+  prevOnTarget = positions.map((p, i) =>
+    p.row === level.targets[i].row && p.col === level.targets[i].col
+  );
 
   if (level.hasToggle) {
     for (let a = 0; a < level.numAgents; a++) {
@@ -372,6 +431,10 @@ function resetLevel() {
   displayPos = positions.map(p => ({ row: p.row, col: p.col }));
   moveCount = 0;
   undoStack = [];
+  prevOnTarget = positions.map((p, i) =>
+    p.row === level.targets[i].row && p.col === level.targets[i].col
+  );
+  renderer.clearTrails();
 
   if (level.hasToggle) {
     for (let a = 0; a < level.numAgents; a++) {
@@ -388,7 +451,7 @@ function updateParticles(dt) {
     p.x += p.vx;
     p.y += p.vy;
     p.vy += 0.12;
-    p.life -= dt * 1.2;
+    p.life -= dt * 1.5;
     if (p.life <= 0) particles.splice(i, 1);
   }
 }
@@ -397,12 +460,15 @@ function drawParticles() {
   const ctx = renderer.ctx;
   for (const p of particles) {
     ctx.globalAlpha = Math.max(0, p.life);
+    ctx.shadowColor = p.color;
+    ctx.shadowBlur = 6;
     ctx.fillStyle = p.color;
     ctx.beginPath();
     ctx.arc(p.x, p.y, p.r * p.life, 0, Math.PI * 2);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
+  ctx.shadowBlur = 0;
 }
 
 // ── Render ─────────────────────────────────────────────
@@ -411,114 +477,175 @@ function render(now) {
   renderer.clear(W, H);
   const ctx = renderer.ctx;
 
-  if (state === State.MENU) renderMenu(ctx);
+  if (state === State.MENU) renderMenu(ctx, now);
   else if (state === State.PLAYING || state === State.WIN) renderGame(ctx);
   else if (state === State.GAME_OVER) renderGameOver(ctx);
   else if (state === State.LEADERBOARD) renderLeaderboard(ctx);
 
   drawParticles();
+
+  // Mute button (always visible)
+  drawMuteButton(ctx);
+
+  renderer.endFrame();
 }
 
-function renderMenu(ctx) {
-  // Title
-  renderer.text('HIVEMIND', W / 2, H * 0.2, { color: '#f0c040', size: 48, bold: true });
-  renderer.text('One Mind. Many Bodies. Zero Margin for Error.', W / 2, H * 0.2 + 36, {
-    color: 'rgba(255,255,255,0.4)', size: 11
+function drawMuteButton(ctx) {
+  const z = getMuteZone();
+  const hover = isInside(mouseX, mouseY, z);
+  ctx.save();
+  ctx.fillStyle = hover ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.03)';
+  ctx.fillRect(z.x, z.y, z.w, z.h);
+  ctx.fillStyle = audio.isMuted() ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.5)';
+  ctx.font = '14px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(audio.isMuted() ? '\uD83D\uDD07' : '\uD83D\uDD0A', z.x + z.w / 2, z.y + z.h / 2);
+  ctx.restore();
+}
+
+function renderMenu(ctx, now) {
+  const t = now / 1000;
+
+  // Title with glow
+  ctx.save();
+  ctx.shadowColor = '#f0c040';
+  ctx.shadowBlur = 20;
+  renderer.text('HIVEMIND', W / 2, H * 0.18, { color: '#f0c040', size: 58, bold: true });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  renderer.text('One Mind. Many Bodies. Zero Margin for Error.', W / 2, H * 0.18 + 40, {
+    color: 'rgba(255,255,255,0.35)', size: 13
   });
 
-  // Animated connected nodes
+  // Animated network graph
   const cx = W / 2, cy = H * 0.38;
-  const t = performance.now() / 1000;
+  const nodeCount = 7;
   const nodes = [];
-  for (let i = 0; i < 5; i++) {
-    const a = (Math.PI * 2 * i) / 5 + t * 0.3;
-    const r = 35 + Math.sin(t * 0.8 + i) * 8;
+  for (let i = 0; i < nodeCount; i++) {
+    const a = (Math.PI * 2 * i) / nodeCount + t * 0.25;
+    const r = 50 + Math.sin(t * 0.6 + i * 1.2) * 12;
     nodes.push({ x: cx + Math.cos(a) * r, y: cy + Math.sin(a) * r });
   }
 
-  // Connections
-  ctx.lineWidth = 1;
+  // Connections with pulse
   for (let i = 0; i < nodes.length; i++) {
     for (let j = i + 1; j < nodes.length; j++) {
-      ctx.strokeStyle = `rgba(240,192,64,${0.08 + Math.sin(t + i + j) * 0.04})`;
+      const alpha = 0.06 + Math.sin(t * 1.5 + i * 0.7 + j * 0.3) * 0.04;
+      ctx.strokeStyle = `rgba(240,192,64,${alpha})`;
+      ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.moveTo(nodes[i].x, nodes[i].y);
       ctx.lineTo(nodes[j].x, nodes[j].y);
       ctx.stroke();
+
+      // Traveling pulse dot along some connections
+      if ((i + j) % 3 === 0) {
+        const pulseFrac = (t * 0.5 + i * 0.2) % 1;
+        const px = nodes[i].x + (nodes[j].x - nodes[i].x) * pulseFrac;
+        const py = nodes[i].y + (nodes[j].y - nodes[i].y) * pulseFrac;
+        ctx.beginPath();
+        ctx.arc(px, py, 2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(240,192,64,${0.3 * (1 - Math.abs(pulseFrac - 0.5) * 2)})`;
+        ctx.fill();
+      }
     }
   }
 
-  // Nodes
+  // Nodes with glow
   for (let i = 0; i < nodes.length; i++) {
+    const c = AGENT_COLORS[i % AGENT_COLORS.length];
+    ctx.shadowColor = c;
+    ctx.shadowBlur = 10;
     ctx.beginPath();
-    ctx.arc(nodes[i].x, nodes[i].y, 6, 0, Math.PI * 2);
-    ctx.fillStyle = AGENT_COLORS[i];
+    ctx.arc(nodes[i].x, nodes[i].y, 7, 0, Math.PI * 2);
+    ctx.fillStyle = c;
     ctx.fill();
+    ctx.shadowBlur = 0;
   }
 
   // Center node
+  ctx.shadowColor = '#f0c040';
+  ctx.shadowBlur = 12;
   ctx.beginPath();
-  ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+  ctx.arc(cx, cy, 5, 0, Math.PI * 2);
   ctx.fillStyle = '#f0c040';
   ctx.fill();
+  ctx.shadowBlur = 0;
 
   // Buttons
   const btnY = H * 0.55;
-  const playH = isInside(mouseX, mouseY, { x: W / 2 - 110, y: btnY, w: 220, h: 50 });
-  renderer.drawButton(W / 2 - 110, btnY, 220, 50, 'PLAY', playH, true);
+  const playH = isInside(mouseX, mouseY, { x: W / 2 - 120, y: btnY, w: 240, h: 54 });
+  renderer.drawButton(W / 2 - 120, btnY, 240, 54, 'PLAY', playH, true);
 
-  const lbH = isInside(mouseX, mouseY, { x: W / 2 - 110, y: btnY + 64, w: 220, h: 50 });
-  renderer.drawButton(W / 2 - 110, btnY + 64, 220, 50, 'LEADERBOARD', lbH);
+  const lbH = isInside(mouseX, mouseY, { x: W / 2 - 120, y: btnY + 68, w: 240, h: 54 });
+  renderer.drawButton(W / 2 - 120, btnY + 68, 240, 54, 'LEADERBOARD', lbH);
 
-  // How to play
+  // Instructions
   const lines = [
-    'Arrow keys / WASD / Swipe to move',
-    'ALL agents move together, different mazes',
-    'Get every agent to its matching target',
-    'Z = Undo  |  R = Reset'
+    'Arrow keys / WASD / Swipe to move all agents at once',
+    'Each agent has a unique maze — same input, different obstacles',
+    'Get every agent to its target simultaneously',
+    'Z = Undo  |  R = Reset  |  M = Mute'
   ];
   lines.forEach((l, i) => {
-    renderer.text(l, W / 2, H * 0.78 + i * 18, { color: 'rgba(255,255,255,0.25)', size: 11 });
+    renderer.text(l, W / 2, H * 0.78 + i * 20, { color: 'rgba(255,255,255,0.22)', size: 12 });
   });
 }
 
 function renderGame(ctx) {
   const diff = getDifficulty(levelNum);
-  const { layouts, cellSize } = getMazeLayout();
+  const { layouts } = getMazeLayout();
 
   // ── Header ────
-  renderer.text('HIVEMIND', 16, 24, { color: '#f0c040', size: 18, bold: true, align: 'left' });
-  renderer.text(`Level ${levelNum}`, W - 16, 18, { color: 'rgba(255,255,255,0.6)', size: 12, align: 'right' });
-  renderer.text(`${diff.name} (IQ ~${diff.iq})`, W - 16, 34, {
-    color: diff.iq === '200+' ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 11, align: 'right'
+  ctx.save();
+  ctx.shadowColor = '#f0c040';
+  ctx.shadowBlur = 8;
+  renderer.text('HIVEMIND', 24, 28, { color: '#f0c040', size: 20, bold: true, align: 'left' });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  renderer.text(`Level ${levelNum}`, W - 60, 20, { color: 'rgba(255,255,255,0.6)', size: 13, align: 'right' });
+  renderer.text(`${diff.name} (IQ ~${diff.iq})`, W - 60, 38, {
+    color: diff.iq === '200+' ? '#f0c040' : 'rgba(255,255,255,0.3)', size: 11, align: 'right'
   });
 
-  // Moves, par & limit
+  // Move progress bar
   const moveLimit = level.par * 3;
   const movePct = moveCount / moveLimit;
-  const moveColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : 'rgba(255,255,255,0.6)';
-  renderer.text(`Moves: ${moveCount} / ${moveLimit}`, 16, 48, {
-    color: moveColor, size: 12, align: 'left'
+  const barX = 24, barY = 50, barW = 200;
+  const barColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : '#3ea8ff';
+  renderer.drawProgressBar(barX, barY, barW, 6, movePct, barColor);
+
+  const moveColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : 'rgba(255,255,255,0.5)';
+  renderer.text(`Moves: ${moveCount} / ${moveLimit}`, barX, barY + 20, {
+    color: moveColor, size: 11, align: 'left'
   });
-  renderer.text(`Par: ${level.par}`, 16, 64, {
-    color: 'rgba(255,255,255,0.35)', size: 11, align: 'left'
+  renderer.text(`Par: ${level.par}`, barX + barW, barY + 20, {
+    color: 'rgba(255,255,255,0.25)', size: 11, align: 'right'
   });
 
   // Lives
   for (let i = 0; i < 5; i++) {
-    const hx = W - 20 - (4 - i) * 18;
-    drawDiamond(ctx, hx, 54, 6, i < lives ? '#f0c040' : 'rgba(255,255,255,0.08)');
+    const hx = W - 64 - (4 - i) * 20;
+    drawDiamond(ctx, hx, 58, 7, i < lives ? '#f0c040' : 'rgba(255,255,255,0.06)');
   }
 
-  // Score
-  renderer.text(`Score: ${totalScore}`, W / 2, 82, { color: 'rgba(255,255,255,0.4)', size: 11 });
+  // Score centered
+  renderer.text(`Score: ${totalScore}`, W / 2, 88, { color: 'rgba(255,255,255,0.3)', size: 11 });
 
-  // Features indicator
+  // Features
   const features = [];
   if (level.hasPortals) features.push('PORTALS');
-  if (level.hasToggle) features.push('TOGGLE');
+  if (level.hasToggle) features.push('TOGGLE WALLS');
   if (features.length) {
-    renderer.text(features.join(' + '), W / 2, 68, { color: '#ff8f00', size: 10 });
+    ctx.save();
+    ctx.shadowColor = '#ff8f00';
+    ctx.shadowBlur = 6;
+    renderer.text(features.join(' + '), W / 2, 72, { color: '#ff8f00', size: 10 });
+    ctx.shadowBlur = 0;
+    ctx.restore();
   }
 
   // ── Mazes ─────
@@ -551,10 +678,16 @@ function renderGame(ctx) {
   const zones = getButtonZones();
 
   if (state === State.WIN) {
-    // Win overlay
     const stars = getStars(moveCount, level.par);
-    renderer.text('SOLVED!', W / 2, H - 110, { color: '#3eff8e', size: 22, bold: true });
-    renderer.drawStars(W / 2, H - 85, stars);
+
+    ctx.save();
+    ctx.shadowColor = '#3eff8e';
+    ctx.shadowBlur = 15;
+    renderer.text('SOLVED!', W / 2, H - 120, { color: '#3eff8e', size: 26, bold: true });
+    ctx.shadowBlur = 0;
+    ctx.restore();
+
+    renderer.drawStars(W / 2, H - 90, stars);
 
     const nextH = isInside(mouseX, mouseY, zones.next);
     renderer.drawButton(zones.next.x, zones.next.y, zones.next.w, zones.next.h, 'NEXT', nextH, true);
@@ -572,15 +705,20 @@ function renderGame(ctx) {
     renderer.drawButton(zones.menu.x, zones.menu.y, zones.menu.w, zones.menu.h, 'MENU', menuH);
   }
 
-  // Direction hint
+  // Direction arrow (fade out)
   if (lastMoveDir && state === State.PLAYING) {
     const arrows = { up: '\u2191', down: '\u2193', left: '\u2190', right: '\u2192' };
-    renderer.text(arrows[lastMoveDir], W / 2, H - 25, { color: 'rgba(255,255,255,0.15)', size: 20 });
+    renderer.text(arrows[lastMoveDir], W / 2, H - 28, { color: 'rgba(255,255,255,0.12)', size: 22 });
   }
 }
 
 function renderGameOver(ctx) {
-  renderer.text('GAME OVER', W / 2, H * 0.2, { color: '#ff3e5e', size: 36, bold: true });
+  ctx.save();
+  ctx.shadowColor = '#ff3e5e';
+  ctx.shadowBlur = 20;
+  renderer.text('GAME OVER', W / 2, H * 0.18, { color: '#ff3e5e', size: 40, bold: true });
+  ctx.shadowBlur = 0;
+  ctx.restore();
 
   const diff = getDifficulty(levelNum);
   const lines = [
@@ -592,60 +730,67 @@ function renderGameOver(ctx) {
   ];
 
   lines.forEach((l, i) => {
-    const c = i === 3 ? '#f0c040' : 'rgba(255,255,255,0.6)';
-    renderer.text(l, W / 2, H * 0.35 + i * 28, { color: c, size: 15 });
+    const c = i === 3 ? '#f0c040' : 'rgba(255,255,255,0.55)';
+    renderer.text(l, W / 2, H * 0.34 + i * 32, { color: c, size: 16 });
   });
 
   const rank = getRank(totalScore);
-  renderer.text(`Leaderboard: #${rank}`, W / 2, H * 0.35 + lines.length * 28 + 15, {
-    color: rank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.4)', size: 13
+  renderer.text(`Leaderboard: #${rank}`, W / 2, H * 0.34 + lines.length * 32 + 18, {
+    color: rank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 14
   });
 
-  const bh = isInside(mouseX, mouseY, { x: W / 2 - 90, y: H * 0.7, w: 180, h: 50 });
-  renderer.drawButton(W / 2 - 90, H * 0.7, 180, 50, 'MAIN MENU', bh, true);
+  const bh = isInside(mouseX, mouseY, { x: W / 2 - 100, y: H * 0.7, w: 200, h: 54 });
+  renderer.drawButton(W / 2 - 100, H * 0.7, 200, 54, 'MAIN MENU', bh, true);
 }
 
 function renderLeaderboard(ctx) {
-  renderer.text('LEADERBOARD', W / 2, 45, { color: '#f0c040', size: 26, bold: true });
+  ctx.save();
+  ctx.shadowColor = '#f0c040';
+  ctx.shadowBlur = 12;
+  renderer.text('LEADERBOARD', W / 2, 50, { color: '#f0c040', size: 30, bold: true });
+  ctx.shadowBlur = 0;
+  ctx.restore();
 
   const board = getLeaderboard();
+  // Center the table with max width
+  const tableW = Math.min(W - 60, 600);
+  const tableX = (W - tableW) / 2;
 
   if (board.length === 0) {
-    renderer.text('No entries yet. Be the first!', W / 2, 120, {
-      color: 'rgba(255,255,255,0.4)', size: 13
+    renderer.text('No entries yet. Be the first!', W / 2, 130, {
+      color: 'rgba(255,255,255,0.35)', size: 14
     });
   } else {
-    // Header
-    ctx.fillStyle = 'rgba(255,255,255,0.35)';
-    ctx.font = '10px "JetBrains Mono", monospace';
+    ctx.fillStyle = 'rgba(255,255,255,0.3)';
+    ctx.font = '11px "JetBrains Mono", monospace';
     ctx.textAlign = 'left';
-    ctx.fillText('#', 24, 85);
-    ctx.fillText('Name', 50, 85);
-    ctx.fillText('Score', W * 0.5, 85);
-    ctx.fillText('Lvl', W * 0.7, 85);
-    ctx.fillText('Stars', W * 0.82, 85);
+    ctx.fillText('#', tableX, 95);
+    ctx.fillText('Name', tableX + 36, 95);
+    ctx.fillText('Score', tableX + tableW * 0.45, 95);
+    ctx.fillText('Lvl', tableX + tableW * 0.65, 95);
+    ctx.fillText('Stars', tableX + tableW * 0.8, 95);
 
-    ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-    ctx.beginPath(); ctx.moveTo(24, 92); ctx.lineTo(W - 24, 92); ctx.stroke();
+    ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+    ctx.beginPath(); ctx.moveTo(tableX, 102); ctx.lineTo(tableX + tableW, 102); ctx.stroke();
 
-    const max = Math.min(board.length, 12);
+    const max = Math.min(board.length, 14);
     for (let i = 0; i < max; i++) {
       const e = board[i];
-      const y = 112 + i * 26;
+      const y = 124 + i * 28;
       const top3 = i < 3;
-      ctx.font = `${top3 ? 'bold ' : ''}12px "JetBrains Mono", monospace`;
-      ctx.fillStyle = top3 ? '#f0c040' : 'rgba(255,255,255,0.55)';
+      ctx.font = `${top3 ? 'bold ' : ''}13px "JetBrains Mono", monospace`;
+      ctx.fillStyle = top3 ? '#f0c040' : 'rgba(255,255,255,0.5)';
       ctx.textAlign = 'left';
-      ctx.fillText(`${i + 1}`, 24, y);
-      ctx.fillText(e.name, 50, y);
-      ctx.fillText(`${e.score}`, W * 0.5, y);
-      ctx.fillText(`${e.level}`, W * 0.7, y);
-      ctx.fillText(`${'★'.repeat(Math.min(e.stars, 99))}`, W * 0.82, y);
+      ctx.fillText(`${i + 1}`, tableX, y);
+      ctx.fillText(e.name, tableX + 36, y);
+      ctx.fillText(`${e.score}`, tableX + tableW * 0.45, y);
+      ctx.fillText(`${e.level}`, tableX + tableW * 0.65, y);
+      ctx.fillText(`${e.stars}\u2605`, tableX + tableW * 0.8, y);
     }
   }
 
-  const bh = isInside(mouseX, mouseY, { x: W / 2 - 80, y: H - 70, w: 160, h: 45 });
-  renderer.drawButton(W / 2 - 80, H - 70, 160, 45, 'BACK', bh);
+  const bh = isInside(mouseX, mouseY, { x: W / 2 - 90, y: H - 76, w: 180, h: 50 });
+  renderer.drawButton(W / 2 - 90, H - 76, 180, 50, 'BACK', bh);
 }
 
 // ── Helpers ────────────────────────────────────────────
@@ -666,10 +811,11 @@ function drawDiamond(ctx, x, y, s, color) {
 let lastTime = performance.now();
 
 function loop(now) {
-  const dt = (now - lastTime) / 1000;
+  const dt = Math.min((now - lastTime) / 1000, 0.05); // cap dt
   lastTime = now;
 
   renderer.tick(dt);
+  renderer.updateTrails(dt);
   updateAnimation(now);
   updateParticles(dt);
   render(now);
