@@ -11,13 +11,18 @@ import {
   saveLevelResult, getMaxUnlockedLevel, getTotalStars
 } from './leaderboard.js';
 import * as audio from './audio.js';
+import * as dialogue from './dialogue.js';
+import * as tts from './tts.js';
 
 // ── Constants ──────────────────────────────────────────
-const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4 };
+const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4, AGE_GATE: 5 };
 const ANIM_DURATION = 130; // ms
 
 // ── State ──────────────────────────────────────────────
-let state = State.MENU;
+const ageVerified = localStorage.getItem('hivemind_age_verified') === 'true';
+let state = ageVerified ? State.MENU : State.AGE_GATE;
+let welcomeShown = false;
+let ambientStarted = false;
 let level = null;
 let levelNum = 1;
 let positions = [];
@@ -58,7 +63,19 @@ resize();
 // ── Input ──────────────────────────────────────────────
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'm' || e.key === 'M') { audio.toggleMute(); return; }
+  if (e.key === 'm' || e.key === 'M') { audio.toggleMute(); tts.setEnabled(!audio.isMuted()); return; }
+
+  // Dialogue input — blocks all other input
+  if (dialogue.isActive()) {
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); dialogue.advance(); }
+    return;
+  }
+
+  // Age gate
+  if (state === State.AGE_GATE) {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); confirmAge(); }
+    return;
+  }
 
   if (state === State.PLAYING && !animating) {
     const map = {
@@ -181,10 +198,30 @@ function isInside(mx, my, zone) {
 // ── Click ──────────────────────────────────────────────
 
 function handleClick(cx, cy) {
+  // Dialogue input — blocks all other clicks
+  if (dialogue.isActive()) {
+    dialogue.advance();
+    return;
+  }
+
   // Mute button (global)
   if (isInside(cx, cy, getMuteZone())) {
     audio.toggleMute();
+    tts.setEnabled(!audio.isMuted());
     audio.playClick();
+    return;
+  }
+
+  // Age gate
+  if (state === State.AGE_GATE) {
+    const btnY = H * 0.58;
+    if (cx > W / 2 - 140 && cx < W / 2 + 140) {
+      if (cy > btnY && cy < btnY + 54) { confirmAge(); }
+      if (cy > btnY + 68 && cy < btnY + 122) {
+        // Exit: navigate away
+        window.location.href = 'about:blank';
+      }
+    }
     return;
   }
 
@@ -229,15 +266,37 @@ function handleClick(cx, cy) {
 
 // ── Game Logic ─────────────────────────────────────────
 
+function confirmAge() {
+  localStorage.setItem('hivemind_age_verified', 'true');
+  audio.playClick();
+  state = State.MENU;
+  startAmbientAudio();
+}
+
+function startAmbientAudio() {
+  if (!ambientStarted) {
+    audio.startAmbient();
+    ambientStarted = true;
+  }
+}
+
 function startGame() {
+  startAmbientAudio();
   levelNum = 1;
   totalScore = 0;
   totalStars = 0;
   lives = 5;
-  loadLevel(levelNum);
+
+  if (!welcomeShown) {
+    welcomeShown = true;
+    loadLevel(levelNum, true);
+    dialogue.startDialogue(dialogue.getWelcomeDialogue(), null);
+  } else {
+    loadLevel(levelNum);
+  }
 }
 
-function loadLevel(num) {
+function loadLevel(num, skipIntro = false) {
   level = generateLevel(num);
   positions = level.starts.map(s => ({ ...s }));
   displayPos = positions.map(p => ({ row: p.row, col: p.col }));
@@ -251,6 +310,14 @@ function loadLevel(num) {
   renderer.clearTrails();
   state = State.PLAYING;
   audio.playLevelStart();
+
+  // Level intro dialogue for milestone levels
+  if (!skipIntro) {
+    const intro = dialogue.getLevelIntro(num);
+    if (intro) {
+      dialogue.startDialogue(intro, null);
+    }
+  }
 }
 
 function executeMove(dir) {
@@ -312,9 +379,9 @@ function executeMove(dir) {
     if (lives <= 0) {
       state = State.GAME_OVER;
       audio.playGameOver();
-      promptName();
+      dialogue.startDialogue(dialogue.getGameOverDialogue(), () => { promptName(); });
     } else {
-      loadLevel(levelNum);
+      dialogue.startDialogue(dialogue.getLoseLifeDialogue(), () => { loadLevel(levelNum, true); });
     }
   }
 }
@@ -375,6 +442,9 @@ function onWin() {
   state = State.WIN;
 
   audio.playWin();
+
+  // Win dialogue
+  dialogue.startDialogue(dialogue.getWinDialogue(stars), null);
 
   // Big celebration particles
   for (let i = 0; i < 60; i++) {
@@ -477,12 +547,16 @@ function render(now) {
   renderer.clear(W, H);
   const ctx = renderer.ctx;
 
-  if (state === State.MENU) renderMenu(ctx, now);
+  if (state === State.AGE_GATE) renderAgeGate(ctx, now);
+  else if (state === State.MENU) renderMenu(ctx, now);
   else if (state === State.PLAYING || state === State.WIN) renderGame(ctx);
   else if (state === State.GAME_OVER) renderGameOver(ctx);
   else if (state === State.LEADERBOARD) renderLeaderboard(ctx);
 
   drawParticles();
+
+  // Dialogue overlay (renders on top of everything)
+  dialogue.draw(ctx, W, H, now / 1000);
 
   // Mute button (always visible)
   drawMuteButton(ctx);
@@ -502,6 +576,108 @@ function drawMuteButton(ctx) {
   ctx.textBaseline = 'middle';
   ctx.fillText(audio.isMuted() ? '\uD83D\uDD07' : '\uD83D\uDD0A', z.x + z.w / 2, z.y + z.h / 2);
   ctx.restore();
+}
+
+function renderAgeGate(ctx, now) {
+  const t = now / 1000;
+
+  // Ominous red radial glow
+  const grad = ctx.createRadialGradient(W / 2, H * 0.15, 0, W / 2, H * 0.15, 350);
+  grad.addColorStop(0, 'rgba(255, 30, 30, 0.06)');
+  grad.addColorStop(1, 'transparent');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Pulsing border vignette
+  const vPulse = 0.03 + Math.sin(t * 1.5) * 0.015;
+  const vGrad = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.max(W, H) * 0.7);
+  vGrad.addColorStop(0, 'transparent');
+  vGrad.addColorStop(1, `rgba(255, 20, 20, ${vPulse})`);
+  ctx.fillStyle = vGrad;
+  ctx.fillRect(0, 0, W, H);
+
+  // Warning triangle
+  const iconY = H * 0.18;
+  ctx.save();
+  ctx.shadowColor = '#ff3e5e';
+  ctx.shadowBlur = 25 + Math.sin(t * 2) * 8;
+
+  ctx.beginPath();
+  ctx.moveTo(W / 2, iconY - 32);
+  ctx.lineTo(W / 2 + 38, iconY + 28);
+  ctx.lineTo(W / 2 - 38, iconY + 28);
+  ctx.closePath();
+  ctx.strokeStyle = '#ff3e5e';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+
+  // Exclamation mark
+  ctx.fillStyle = '#ff3e5e';
+  ctx.font = 'bold 30px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('!', W / 2, iconY + 6);
+  ctx.restore();
+
+  // Title
+  ctx.save();
+  ctx.shadowColor = '#ff3e5e';
+  ctx.shadowBlur = 18;
+  renderer.text('AGE VERIFICATION', W / 2, H * 0.3, { color: '#ff3e5e', size: 30, bold: true });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  // Divider line
+  ctx.strokeStyle = 'rgba(255, 62, 94, 0.2)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(W / 2 - 130, H * 0.34);
+  ctx.lineTo(W / 2 + 130, H * 0.34);
+  ctx.stroke();
+
+  // Description text
+  const lines = [
+    'This game contains mature themes and',
+    'psychological content intended for',
+    'players aged 18 and above.',
+    '',
+    'By proceeding, you confirm that you',
+    'are at least 18 years of age.'
+  ];
+
+  lines.forEach((line, i) => {
+    renderer.text(line, W / 2, H * 0.40 + i * 24, {
+      color: line ? 'rgba(255, 255, 255, 0.6)' : 'transparent', size: 14
+    });
+  });
+
+  // Buttons
+  const btnY = H * 0.58;
+  const confirmZone = { x: W / 2 - 140, y: btnY, w: 280, h: 54 };
+  const exitZone = { x: W / 2 - 140, y: btnY + 68, w: 280, h: 54 };
+
+  const confirmHover = isInside(mouseX, mouseY, confirmZone);
+  renderer.drawButton(confirmZone.x, confirmZone.y, confirmZone.w, confirmZone.h,
+    'I AM 18 OR OLDER', confirmHover, true);
+
+  const exitHover = isInside(mouseX, mouseY, exitZone);
+  renderer.drawButton(exitZone.x, exitZone.y, exitZone.w, exitZone.h, 'EXIT', exitHover);
+
+  // Subtle animated particles
+  ctx.globalAlpha = 0.06;
+  for (let i = 0; i < 8; i++) {
+    const px = W / 2 + Math.sin(t * 0.3 + i * 1.8) * 180;
+    const py = H * 0.5 + Math.cos(t * 0.25 + i * 2.1) * 120;
+    ctx.beginPath();
+    ctx.arc(px, py, 1.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#ff3e5e';
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Footer
+  renderer.text('HIVEMIND', W / 2, H - 30, { color: 'rgba(255, 255, 255, 0.12)', size: 11 });
 }
 
 function renderMenu(ctx, now) {
@@ -816,6 +992,7 @@ function loop(now) {
 
   renderer.tick(dt);
   renderer.updateTrails(dt);
+  dialogue.update(dt);
   updateAnimation(now);
   updateParticles(dt);
   render(now);

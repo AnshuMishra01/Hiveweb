@@ -161,3 +161,80 @@ export function playLevelStart() {
   playTone(330, 0.08, 'sine', 0.08);
   playTone(440, 0.08, 'sine', 0.08, 0.08);
 }
+
+// ── Typing Click (for dialogue) ───────────────────
+
+export function playTypingClick() {
+  const freq = 600 + Math.random() * 500;
+  playTone(freq, 0.018, 'square', 0.025);
+}
+
+// ── Ambient Background Drone ──────────────────────
+
+let ambientNodes = null;
+
+export function startAmbient() {
+  const ac = ensureCtx();
+  if (ambientNodes) return;
+
+  // Master ambient gain
+  const ambGain = ac.createGain();
+  ambGain.gain.value = 0.04;
+  ambGain.connect(masterGain);
+
+  // Low sine drone (A1 = 55Hz)
+  const osc1 = ac.createOscillator();
+  osc1.type = 'sine';
+  osc1.frequency.value = 55;
+  osc1.connect(ambGain);
+  osc1.start();
+
+  // Subtle fifth (E2 = 82.4Hz) with triangle
+  const gain2 = ac.createGain();
+  gain2.gain.value = 0.6;
+  gain2.connect(ambGain);
+  const osc2 = ac.createOscillator();
+  osc2.type = 'triangle';
+  osc2.frequency.value = 82.4;
+  osc2.connect(gain2);
+  osc2.start();
+
+  // High shimmer (very quiet)
+  const gain3 = ac.createGain();
+  gain3.gain.value = 0.15;
+  gain3.connect(ambGain);
+  const osc3 = ac.createOscillator();
+  osc3.type = 'sine';
+  osc3.frequency.value = 440;
+  osc3.connect(gain3);
+  osc3.start();
+
+  // LFO to pulse the volume slowly
+  const lfo = ac.createOscillator();
+  lfo.type = 'sine';
+  lfo.frequency.value = 0.12;
+  const lfoGain = ac.createGain();
+  lfoGain.gain.value = 0.015;
+  lfo.connect(lfoGain);
+  lfoGain.connect(ambGain.gain);
+  lfo.start();
+
+  // Second LFO for pitch drift on shimmer
+  const lfo2 = ac.createOscillator();
+  lfo2.type = 'sine';
+  lfo2.frequency.value = 0.08;
+  const lfo2Gain = ac.createGain();
+  lfo2Gain.gain.value = 15;
+  lfo2.connect(lfo2Gain);
+  lfo2Gain.connect(osc3.frequency);
+  lfo2.start();
+
+  ambientNodes = { osc1, osc2, osc3, lfo, lfo2, ambGain, gain2, gain3 };
+}
+
+export function stopAmbient() {
+  if (!ambientNodes) return;
+  const { osc1, osc2, osc3, lfo, lfo2 } = ambientNodes;
+  [osc1, osc2, osc3, lfo, lfo2].forEach(o => { try { o.stop(); } catch (e) {} });
+  ambientNodes = null;
+}
