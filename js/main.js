@@ -33,6 +33,7 @@ let totalScore = 0;
 let totalStars = 0;
 let lives = 5;
 let playerIQ = getIQ();
+let playerName = localStorage.getItem('hivemind_name') || '';
 let animating = false;
 let animStart = 0;
 let animFrom = [];
@@ -55,6 +56,16 @@ let claimMessageColor = '#3eff8e';
 
 // Swipe
 let touchStartX = 0, touchStartY = 0, touchStartTime = 0;
+
+// Leaderboard cache (async API can't be called in render loop)
+let cachedBoard = [];
+let cachedRank = 1;
+let boardDirty = true;
+
+function refreshLeaderboard() {
+  getLeaderboard().then(board => { cachedBoard = board; });
+  getRank(totalScore).then(rank => { cachedRank = rank; });
+}
 
 // Track which agents just landed on target (for per-agent sound)
 let prevOnTarget = [];
@@ -241,10 +252,14 @@ function handleClick(cx, cy) {
   }
 
   if (state === State.MENU) {
+    // Change name button
+    const cnZone = { x: W / 2 + 120, y: H * 0.18 + 50, w: 90, h: 22 };
+    if (playerName && isInside(cx, cy, cnZone)) { changeName(); audio.playClick(); return; }
+
     const btnY = H * 0.55;
     if (cx > W / 2 - 120 && cx < W / 2 + 120) {
       if (cy > btnY && cy < btnY + 54) { startGame(); audio.playClick(); }
-      if (cy > btnY + 68 && cy < btnY + 122) { state = State.LEADERBOARD; audio.playClick(); }
+      if (cy > btnY + 68 && cy < btnY + 122) { state = State.LEADERBOARD; refreshLeaderboard(); audio.playClick(); }
     }
     return;
   }
@@ -296,8 +311,16 @@ function startAmbientAudio() {
   }
 }
 
-function startGame() {
+async function startGame() {
   startAmbientAudio();
+
+  // Ask for name if not set
+  if (!playerName) {
+    const name = await askForUniqueName('Choose a unique player name:');
+    if (!name) return; // cancelled
+    playerName = name;
+    localStorage.setItem('hivemind_name', name);
+  }
 
   // Try to resume saved session
   const session = loadSession();
@@ -325,6 +348,27 @@ function startGame() {
     totalStars = 0;
     lives = 5;
     loadLevel(levelNum);
+  }
+}
+
+function changeName() {
+  const name = prompt(`Current name: ${playerName}\n\nEnter new name (or cancel):`);
+  if (name && name.trim()) {
+    const clean = name.trim().slice(0, 16);
+    fetch(`/api/leaderboard/check/${encodeURIComponent(clean)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.available) {
+          playerName = clean;
+          localStorage.setItem('hivemind_name', clean);
+        } else {
+          alert(`"${clean}" is already taken!`);
+        }
+      })
+      .catch(() => {
+        playerName = clean;
+        localStorage.setItem('hivemind_name', clean);
+      });
   }
 }
 
@@ -441,6 +485,7 @@ function claimImpossible() {
 
     if (lives <= 0) {
       state = State.GAME_OVER;
+      refreshLeaderboard();
       audio.playGameOver();
       dialogue.startDialogue(dialogue.getGameOverDialogue(), () => { promptName(); });
     }
@@ -508,6 +553,7 @@ function executeMove(dir) {
     persistSession();
     if (lives <= 0) {
       state = State.GAME_OVER;
+      refreshLeaderboard();
       audio.playGameOver();
       dialogue.startDialogue(dialogue.getGameOverDialogue(), () => { promptName(); });
     } else {
@@ -601,14 +647,39 @@ function nextLevel() {
 
 function promptName() {
   clearSession();
-  setTimeout(() => {
-    let name = prompt(
-      `GAME OVER!\nScore: ${totalScore} | Level: ${levelNum} | IQ: ${playerIQ}\n\nEnter your name:`
-    );
-    if (name && name.trim()) {
-      addEntry(name.trim(), totalScore, levelNum, totalStars, playerIQ);
+  setTimeout(async () => {
+    if (playerName) {
+      // Auto-submit with saved name
+      await addEntry(playerName, totalScore, levelNum, totalStars, playerIQ);
+      refreshLeaderboard();
+    } else {
+      // No name set — ask for one
+      const name = await askForUniqueName(`GAME OVER! Score: ${totalScore} | IQ: ${playerIQ}\n\nEnter your name:`);
+      if (name) {
+        playerName = name;
+        localStorage.setItem('hivemind_name', name);
+        await addEntry(name, totalScore, levelNum, totalStars, playerIQ);
+        refreshLeaderboard();
+      }
     }
   }, 200);
+}
+
+async function askForUniqueName(message) {
+  while (true) {
+    const name = prompt(message);
+    if (!name || !name.trim()) return null;
+    const clean = name.trim().slice(0, 16);
+    try {
+      const res = await fetch(`/api/leaderboard/check/${encodeURIComponent(clean)}`);
+      const data = await res.json();
+      if (data.available) return clean;
+      message = `"${clean}" is already taken! Pick another name:`;
+    } catch {
+      // API down — allow it locally
+      return clean;
+    }
+  }
 }
 
 function undo() {
@@ -827,19 +898,35 @@ function renderMenu(ctx, now) {
     color: 'rgba(255,255,255,0.35)', size: 13
   });
 
+  // Player info line
+  let infoY = H * 0.18 + 60;
+  if (playerName) {
+    const iq = getIQ();
+    renderer.text(`Player: ${playerName}   IQ: ${iq}`, W / 2, infoY, {
+      color: '#3ea8ff', size: 12
+    });
+    // Change name button (small, right of player info)
+    const cnZone = { x: W / 2 + 120, y: infoY - 10, w: 90, h: 22 };
+    const cnH = isInside(mouseX, mouseY, cnZone);
+    ctx.save();
+    ctx.fillStyle = cnH ? 'rgba(255,255,255,0.12)' : 'rgba(255,255,255,0.04)';
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.lineWidth = 1;
+    renderer.roundRect(cnZone.x, cnZone.y, cnZone.w, cnZone.h, 4);
+    ctx.fill(); ctx.stroke();
+    ctx.fillStyle = cnH ? 'rgba(255,255,255,0.6)' : 'rgba(255,255,255,0.3)';
+    ctx.font = '9px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('CHANGE NAME', cnZone.x + cnZone.w / 2, cnZone.y + cnZone.h / 2);
+    ctx.restore();
+    infoY += 18;
+  }
+
   // Show saved session info
   const session = loadSession();
   if (session && session.levelNum > 1) {
-    renderer.text(`Resume: Level ${session.levelNum} | Score: ${session.totalScore}`, W / 2, H * 0.18 + 62, {
+    renderer.text(`Resume: Level ${session.levelNum} | Score: ${session.totalScore}`, W / 2, infoY, {
       color: 'rgba(62,168,255,0.5)', size: 11
-    });
-  }
-
-  // Show player IQ
-  const iq = getIQ();
-  if (iq !== 100) {
-    renderer.text(`Your IQ: ${iq}`, W / 2, H * 0.18 + (session && session.levelNum > 1 ? 80 : 62), {
-      color: iq >= 130 ? '#f0c040' : 'rgba(255,255,255,0.3)', size: 11
     });
   }
 
@@ -962,7 +1049,8 @@ function renderGame(ctx) {
   }
 
   // Score centered
-  renderer.text(`Score: ${totalScore}`, W / 2, 88, { color: 'rgba(255,255,255,0.3)', size: 11 });
+  const scoreLabel = playerName ? `${playerName}  |  Score: ${totalScore}` : `Score: ${totalScore}`;
+  renderer.text(scoreLabel, W / 2, 88, { color: 'rgba(255,255,255,0.3)', size: 11 });
 
   // Features
   const features = [];
@@ -1114,9 +1202,8 @@ function renderGameOver(ctx) {
     renderer.text(l, W / 2, H * 0.34 + i * 32, { color: c, size: 16 });
   });
 
-  const rank = getRank(totalScore);
-  renderer.text(`Leaderboard: #${rank}`, W / 2, H * 0.34 + lines.length * 32 + 18, {
-    color: rank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 14
+  renderer.text(`Leaderboard: #${cachedRank}`, W / 2, H * 0.34 + lines.length * 32 + 18, {
+    color: cachedRank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 14
   });
 
   const bh = isInside(mouseX, mouseY, { x: W / 2 - 100, y: H * 0.7, w: 200, h: 54 });
@@ -1131,7 +1218,7 @@ function renderLeaderboard(ctx) {
   ctx.shadowBlur = 0;
   ctx.restore();
 
-  const board = getLeaderboard();
+  const board = cachedBoard;
   // Center the table with max width
   const tableW = Math.min(W - 60, 650);
   const tableX = (W - tableW) / 2;
