@@ -63,9 +63,12 @@ let cachedRank = 1;
 let boardDirty = true;
 
 function refreshLeaderboard() {
-  getLeaderboard().then(board => { cachedBoard = board; });
-  getRank(totalScore).then(rank => { cachedRank = rank; });
+  getLeaderboard().then(board => { cachedBoard = board; }).catch(() => {});
+  getRank(totalScore).then(rank => { cachedRank = rank; }).catch(() => {});
 }
+
+// Fetch leaderboard on startup
+refreshLeaderboard();
 
 // Track which agents just landed on target (for per-agent sound)
 let prevOnTarget = [];
@@ -620,6 +623,12 @@ function onWin() {
   playerIQ = adjustIQ(stars >= 3 ? 5 : stars >= 2 ? 3 : 1);
   saveLevelResult(levelNum, moveCount, stars);
   persistSession();
+
+  // Update leaderboard in DB on every win (upsert keeps best score)
+  if (playerName) {
+    addEntry(playerName, totalScore, levelNum, totalStars, playerIQ)
+      .then(() => refreshLeaderboard()).catch(() => {});
+  }
   winTime = performance.now();
   state = State.WIN;
 
