@@ -306,6 +306,11 @@ export function generateLevel(levelNum) {
     }
     if (!diverse) continue;
 
+    // BFS validation — reverse-solve can produce invalid solutions
+    // when agents get blocked during reverse moves
+    const bfsSol = solveBFS(starts, targets, grids, cfg.gridSize, portalSets, 300000);
+    if (!bfsSol) continue; // actually unsolvable, regenerate
+
     return {
       level: levelNum,
       numAgents: cfg.numAgents,
@@ -313,8 +318,8 @@ export function generateLevel(levelNum) {
       grids,
       starts,
       targets,
-      par: solution.length,
-      solution,
+      par: bfsSol.length,
+      solution: bfsSol,
       impossible: false,
       portals: portalSets,
       toggleWalls: toggleSets,

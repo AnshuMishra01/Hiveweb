@@ -416,7 +416,7 @@ function showHint() {
   if (!level) return;
   const sol = solveBFS(positions, level.targets, level.grids, level.gridSize, level.portals);
   if (!sol || sol.length === 0) {
-    hintMessage = 'No solution found from current state!';
+    hintMessage = 'No solution exists! Try pressing IMPOSSIBLE (I)';
     hintMessageTime = performance.now();
     return;
   }
@@ -434,7 +434,11 @@ function showHint() {
 function claimImpossible() {
   if (!level || animating) return;
 
-  if (level.impossible) {
+  // Actually check solvability from CURRENT position via BFS
+  const sol = solveBFS(positions, level.targets, level.grids, level.gridSize, level.portals);
+  const actuallyImpossible = (sol === null);
+
+  if (actuallyImpossible) {
     // Correct! The level IS impossible
     const bonus = 500 + levelNum * 50;
     totalScore += bonus;
