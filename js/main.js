@@ -3,12 +3,13 @@
 
 import {
   generateLevel, moveAgent, checkWin, getStars,
-  getDifficulty, AGENT_COLORS, AGENT_NAMES, applyToggle
+  getDifficulty, AGENT_COLORS, AGENT_NAMES, applyToggle, solveBFS
 } from './level.js';
 import { Renderer } from './renderer.js';
 import {
   getLeaderboard, addEntry, getRank,
-  saveLevelResult, getMaxUnlockedLevel, getTotalStars
+  saveLevelResult, getMaxUnlockedLevel, getTotalStars,
+  getIQ, adjustIQ, saveSession, loadSession, clearSession
 } from './leaderboard.js';
 import * as audio from './audio.js';
 import * as dialogue from './dialogue.js';
@@ -19,8 +20,7 @@ const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4, AGE_G
 const ANIM_DURATION = 130; // ms
 
 // ── State ──────────────────────────────────────────────
-const ageVerified = localStorage.getItem('hivemind_age_verified') === 'true';
-let state = ageVerified ? State.MENU : State.AGE_GATE;
+let state = State.MENU;
 let welcomeShown = false;
 let ambientStarted = false;
 let level = null;
@@ -32,6 +32,7 @@ let undoStack = [];
 let totalScore = 0;
 let totalStars = 0;
 let lives = 5;
+let playerIQ = getIQ();
 let animating = false;
 let animStart = 0;
 let animFrom = [];
@@ -40,6 +41,17 @@ let lastMoveDir = null;
 let winTime = 0;
 let particles = [];
 let mouseX = 0, mouseY = 0;
+
+// Hint system
+let hintSolution = null;
+let hintIndex = 0;
+let hintMessage = '';
+let hintMessageTime = 0;
+
+// Impossible claim feedback
+let claimMessage = '';
+let claimMessageTime = 0;
+let claimMessageColor = '#3eff8e';
 
 // Swipe
 let touchStartX = 0, touchStartY = 0, touchStartTime = 0;
@@ -86,6 +98,8 @@ document.addEventListener('keydown', e => {
     if (map[e.key]) { e.preventDefault(); executeMove(map[e.key]); }
     if (e.key === 'z' || e.key === 'Z') { undo(); audio.playUndo(); }
     if (e.key === 'r' || e.key === 'R') { resetLevel(); audio.playReset(); }
+    if (e.key === 'h' || e.key === 'H') { showHint(); }
+    if (e.key === 'i' || e.key === 'I') { claimImpossible(); }
   }
   if (state === State.MENU && (e.key === 'Enter' || e.key === ' ')) { startGame(); audio.playClick(); }
   if (state === State.WIN && (e.key === 'Enter' || e.key === ' ')) { nextLevel(); audio.playClick(); }
@@ -175,15 +189,16 @@ function getMazeLayout() {
 }
 
 function getButtonZones() {
-  const bw = 100, bh = 40, gap = 14;
+  const bw = 90, bh = 40, gap = 10;
   const y = H - 72;
-  const totalW = bw * 4 + gap * 3;
+  const totalW = bw * 5 + gap * 4;
   const sx = (W - totalW) / 2;
   return {
-    undo:  { x: sx, y, w: bw, h: bh },
-    reset: { x: sx + bw + gap, y, w: bw, h: bh },
-    menu:  { x: sx + (bw + gap) * 2, y, w: bw, h: bh },
-    next:  { x: sx + (bw + gap) * 3, y, w: bw, h: bh }
+    undo:       { x: sx, y, w: bw, h: bh },
+    reset:      { x: sx + (bw + gap), y, w: bw, h: bh },
+    impossible: { x: sx + (bw + gap) * 2, y, w: bw, h: bh },
+    menu:       { x: sx + (bw + gap) * 3, y, w: bw, h: bh },
+    next:       { x: sx + (bw + gap) * 4, y, w: bw, h: bh }
   };
 }
 
@@ -238,6 +253,7 @@ function handleClick(cx, cy) {
     const zones = getButtonZones();
     if (isInside(cx, cy, zones.undo)) { undo(); audio.playUndo(); }
     else if (isInside(cx, cy, zones.reset)) { resetLevel(); audio.playReset(); }
+    else if (isInside(cx, cy, zones.impossible)) { claimImpossible(); audio.playClick(); }
     else if (isInside(cx, cy, zones.menu)) { state = State.MENU; audio.playClick(); }
     return;
   }
@@ -282,16 +298,32 @@ function startAmbientAudio() {
 
 function startGame() {
   startAmbientAudio();
-  levelNum = 1;
-  totalScore = 0;
-  totalStars = 0;
-  lives = 5;
+
+  // Try to resume saved session
+  const session = loadSession();
+  if (session && !welcomeShown) {
+    levelNum = session.levelNum;
+    totalScore = session.totalScore;
+    totalStars = session.totalStars;
+    lives = session.lives;
+  } else if (!session) {
+    levelNum = 1;
+    totalScore = 0;
+    totalStars = 0;
+    lives = 5;
+  }
+
+  playerIQ = getIQ();
 
   if (!welcomeShown) {
     welcomeShown = true;
     loadLevel(levelNum, true);
     dialogue.startDialogue(dialogue.getWelcomeDialogue(), null);
   } else {
+    levelNum = 1;
+    totalScore = 0;
+    totalStars = 0;
+    lives = 5;
     loadLevel(levelNum);
   }
 }
@@ -308,8 +340,15 @@ function loadLevel(num, skipIntro = false) {
     p.row === level.targets[i].row && p.col === level.targets[i].col
   );
   renderer.clearTrails();
+  hintSolution = null;
+  hintIndex = 0;
+  hintMessage = '';
+  claimMessage = '';
   state = State.PLAYING;
   audio.playLevelStart();
+
+  // Save session progress
+  persistSession();
 
   // Level intro dialogue for milestone levels
   if (!skipIntro) {
@@ -320,10 +359,99 @@ function loadLevel(num, skipIntro = false) {
   }
 }
 
+function persistSession() {
+  saveSession({
+    levelNum,
+    totalScore,
+    totalStars,
+    lives
+  });
+}
+
+function showHint() {
+  if (!level) return;
+  const sol = solveBFS(positions, level.targets, level.grids, level.gridSize, level.portals);
+  if (!sol || sol.length === 0) {
+    hintMessage = 'No solution found from current state!';
+    hintMessageTime = performance.now();
+    return;
+  }
+  hintSolution = sol;
+  hintIndex = 0;
+  const arrows = { up: '\u2191 UP', down: '\u2193 DOWN', left: '\u2190 LEFT', right: '\u2192 RIGHT' };
+  hintMessage = `HINT: ${arrows[sol[0]]}  (${sol.length} moves total)`;
+  hintMessageTime = performance.now();
+  console.log(`%cFull solution (${sol.length} moves):`, 'color: #3ea8ff; font-weight: bold');
+  sol.forEach((d, i) => console.log(`  ${i + 1}. ${arrows[d]}`));
+}
+
+// ── Impossible Claim ───────────────────────────────────
+
+function claimImpossible() {
+  if (!level || animating) return;
+
+  if (level.impossible) {
+    // Correct! The level IS impossible
+    const bonus = 500 + levelNum * 50;
+    totalScore += bonus;
+    playerIQ = adjustIQ(10);
+
+    claimMessage = `GENIUS! Level was impossible! +${bonus} pts, IQ ${playerIQ}`;
+    claimMessageColor = '#3eff8e';
+    claimMessageTime = performance.now();
+
+    audio.playWin();
+
+    // Celebration particles
+    for (let i = 0; i < 40; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 2 + Math.random() * 4;
+      particles.push({
+        x: W / 2 + (Math.random() - 0.5) * W * 0.4,
+        y: H * 0.4 + (Math.random() - 0.5) * 80,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed - 2,
+        life: 1,
+        color: '#3eff8e',
+        r: 2 + Math.random() * 4
+      });
+    }
+
+    // Move to next level after a brief pause
+    saveLevelResult(levelNum, 0, 3);
+    totalStars += 3;
+    persistSession();
+
+    setTimeout(() => { nextLevel(); }, 1200);
+  } else {
+    // Wrong! The level IS solvable — penalty
+    const penalty = 200;
+    totalScore = Math.max(0, totalScore - penalty);
+    playerIQ = adjustIQ(-10);
+    lives--;
+
+    claimMessage = `WRONG! A solution exists. -${penalty} pts, -1 life, IQ ${playerIQ}`;
+    claimMessageColor = '#ff3e5e';
+    claimMessageTime = performance.now();
+
+    audio.playLoseLife();
+    renderer.shake(12);
+
+    persistSession();
+
+    if (lives <= 0) {
+      state = State.GAME_OVER;
+      audio.playGameOver();
+      dialogue.startDialogue(dialogue.getGameOverDialogue(), () => { promptName(); });
+    }
+  }
+}
+
 function executeMove(dir) {
   if (!level || animating) return;
 
   undoStack.push(positions.map(p => ({ ...p })));
+  hintSolution = null; // invalidate hint on move
 
   if (level.hasToggle) {
     for (let a = 0; a < level.numAgents; a++) {
@@ -368,14 +496,16 @@ function executeMove(dir) {
 
   audio.playMove();
 
-  // Move limit check
-  const moveLimit = level.par * 3;
+  // Move limit check (impossible levels have no move limit)
+  const moveLimit = level.impossible ? Infinity : level.par * 3;
   if (moveCount >= moveLimit && !checkWin(positions, level.targets)) {
     animating = false;
     displayPos = positions.map(p => ({ row: p.row, col: p.col }));
     lives--;
+    playerIQ = adjustIQ(-5);
     audio.playLoseLife();
     renderer.shake(12);
+    persistSession();
     if (lives <= 0) {
       state = State.GAME_OVER;
       audio.playGameOver();
@@ -437,7 +567,9 @@ function onWin() {
   const levelScore = stars * 100 + Math.max(0, (level.par - moveCount)) * 50 + levelNum * 25;
   totalScore += levelScore;
   totalStars += stars;
+  playerIQ = adjustIQ(stars >= 3 ? 5 : stars >= 2 ? 3 : 1);
   saveLevelResult(levelNum, moveCount, stars);
+  persistSession();
   winTime = performance.now();
   state = State.WIN;
 
@@ -468,13 +600,13 @@ function nextLevel() {
 }
 
 function promptName() {
+  clearSession();
   setTimeout(() => {
-    const diff = getDifficulty(levelNum);
     let name = prompt(
-      `GAME OVER!\nScore: ${totalScore} | Level: ${levelNum} | IQ ~${diff.iq}\n\nEnter your name:`
+      `GAME OVER!\nScore: ${totalScore} | Level: ${levelNum} | IQ: ${playerIQ}\n\nEnter your name:`
     );
     if (name && name.trim()) {
-      addEntry(name.trim(), totalScore, levelNum, totalStars);
+      addEntry(name.trim(), totalScore, levelNum, totalStars, playerIQ);
     }
   }, 200);
 }
@@ -695,6 +827,22 @@ function renderMenu(ctx, now) {
     color: 'rgba(255,255,255,0.35)', size: 13
   });
 
+  // Show saved session info
+  const session = loadSession();
+  if (session && session.levelNum > 1) {
+    renderer.text(`Resume: Level ${session.levelNum} | Score: ${session.totalScore}`, W / 2, H * 0.18 + 62, {
+      color: 'rgba(62,168,255,0.5)', size: 11
+    });
+  }
+
+  // Show player IQ
+  const iq = getIQ();
+  if (iq !== 100) {
+    renderer.text(`Your IQ: ${iq}`, W / 2, H * 0.18 + (session && session.levelNum > 1 ? 80 : 62), {
+      color: iq >= 130 ? '#f0c040' : 'rgba(255,255,255,0.3)', size: 11
+    });
+  }
+
   // Animated network graph
   const cx = W / 2, cy = H * 0.38;
   const nodeCount = 7;
@@ -759,13 +907,13 @@ function renderMenu(ctx, now) {
   renderer.drawButton(W / 2 - 120, btnY + 68, 240, 54, 'LEADERBOARD', lbH);
 
   // Instructions
-  const lines = [
+  const instrLines = [
     'Arrow keys / WASD / Swipe to move all agents at once',
     'Each agent has a unique maze — same input, different obstacles',
     'Get every agent to its target simultaneously',
-    'Z = Undo  |  R = Reset  |  M = Mute'
+    'Z = Undo | R = Reset | H = Hint | I = Impossible | M = Mute'
   ];
-  lines.forEach((l, i) => {
+  instrLines.forEach((l, i) => {
     renderer.text(l, W / 2, H * 0.78 + i * 20, { color: 'rgba(255,255,255,0.22)', size: 12 });
   });
 }
@@ -783,24 +931,29 @@ function renderGame(ctx) {
   ctx.restore();
 
   renderer.text(`Level ${levelNum}`, W - 60, 20, { color: 'rgba(255,255,255,0.6)', size: 13, align: 'right' });
-  renderer.text(`${diff.name} (IQ ~${diff.iq})`, W - 60, 38, {
-    color: diff.iq === '200+' ? '#f0c040' : 'rgba(255,255,255,0.3)', size: 11, align: 'right'
+
+  // Show player IQ instead of static difficulty IQ
+  const iqColor = playerIQ >= 150 ? '#f0c040' : playerIQ >= 120 ? '#3ea8ff' : playerIQ < 80 ? '#ff3e5e' : 'rgba(255,255,255,0.4)';
+  renderer.text(`IQ: ${playerIQ}  (${diff.name})`, W - 60, 38, {
+    color: iqColor, size: 11, align: 'right'
   });
 
   // Move progress bar
-  const moveLimit = level.par * 3;
-  const movePct = moveCount / moveLimit;
+  const moveLimit = level.impossible ? 15 : level.par * 3;
+  const movePct = level.impossible ? 0 : moveCount / moveLimit;
   const barX = 24, barY = 50, barW = 200;
   const barColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : '#3ea8ff';
   renderer.drawProgressBar(barX, barY, barW, 6, movePct, barColor);
 
   const moveColor = movePct > 0.8 ? '#ff3e5e' : movePct > 0.5 ? '#f0c040' : 'rgba(255,255,255,0.5)';
-  renderer.text(`Moves: ${moveCount} / ${moveLimit}`, barX, barY + 20, {
+  renderer.text(`Moves: ${moveCount}${level.impossible ? '' : ` / ${moveLimit}`}`, barX, barY + 20, {
     color: moveColor, size: 11, align: 'left'
   });
-  renderer.text(`Par: ${level.par}`, barX + barW, barY + 20, {
-    color: 'rgba(255,255,255,0.25)', size: 11, align: 'right'
-  });
+  if (!level.impossible) {
+    renderer.text(`Par: ${level.par}`, barX + barW, barY + 20, {
+      color: 'rgba(255,255,255,0.25)', size: 11, align: 'right'
+    });
+  }
 
   // Lives
   for (let i = 0; i < 5; i++) {
@@ -877,8 +1030,60 @@ function renderGame(ctx) {
     const resetH = isInside(mouseX, mouseY, zones.reset);
     renderer.drawButton(zones.reset.x, zones.reset.y, zones.reset.w, zones.reset.h, 'RESET', resetH);
 
+    // Impossible button — red accent style
+    const impH = isInside(mouseX, mouseY, zones.impossible);
+    ctx.save();
+    const impZone = zones.impossible;
+    ctx.fillStyle = impH ? 'rgba(255, 62, 94, 0.25)' : 'rgba(255, 62, 94, 0.08)';
+    ctx.strokeStyle = impH ? '#ff3e5e' : 'rgba(255, 62, 94, 0.3)';
+    ctx.lineWidth = 1.5;
+    renderer.roundRect(impZone.x, impZone.y, impZone.w, impZone.h, 6);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = impH ? '#ff3e5e' : 'rgba(255, 62, 94, 0.7)';
+    ctx.font = 'bold 11px "JetBrains Mono", monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText('IMPOSSIBLE', impZone.x + impZone.w / 2, impZone.y + impZone.h / 2);
+    ctx.restore();
+
     const menuH = isInside(mouseX, mouseY, zones.menu);
     renderer.drawButton(zones.menu.x, zones.menu.y, zones.menu.w, zones.menu.h, 'MENU', menuH);
+  }
+
+  // Claim message (impossible result feedback)
+  if (claimMessage && performance.now() - claimMessageTime < 6000) {
+    const elapsed = performance.now() - claimMessageTime;
+    const alpha = Math.min(1, 1 - (elapsed - 3500) / 2500);
+    if (alpha > 0) {
+      ctx.save();
+      ctx.shadowColor = claimMessageColor;
+      ctx.shadowBlur = 10 * alpha;
+      ctx.globalAlpha = alpha;
+      renderer.text(claimMessage, W / 2, H - 155, {
+        color: claimMessageColor, size: 13, bold: true
+      });
+      ctx.globalAlpha = 1;
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
+  }
+
+  // Hint message
+  if (hintMessage && performance.now() - hintMessageTime < 8000) {
+    const alpha = Math.min(1, 1 - (performance.now() - hintMessageTime - 5000) / 3000);
+    if (alpha > 0) {
+      ctx.save();
+      ctx.shadowColor = '#3ea8ff';
+      ctx.shadowBlur = 10;
+      ctx.globalAlpha = alpha;
+      renderer.text(hintMessage, W / 2, H - 140, {
+        color: '#3ea8ff', size: 14, bold: true
+      });
+      ctx.globalAlpha = 1;
+      ctx.shadowBlur = 0;
+      ctx.restore();
+    }
   }
 
   // Direction arrow (fade out)
@@ -896,13 +1101,12 @@ function renderGameOver(ctx) {
   ctx.shadowBlur = 0;
   ctx.restore();
 
-  const diff = getDifficulty(levelNum);
   const lines = [
     `Reached Level ${levelNum}`,
     `Total Score: ${totalScore}`,
     `Stars Earned: ${totalStars}`,
-    `IQ Estimate: ~${diff.iq}`,
-    `Rating: ${diff.name}`
+    `IQ: ${playerIQ}`,
+    `Rating: ${getDifficulty(levelNum).name}`
   ];
 
   lines.forEach((l, i) => {
@@ -929,7 +1133,7 @@ function renderLeaderboard(ctx) {
 
   const board = getLeaderboard();
   // Center the table with max width
-  const tableW = Math.min(W - 60, 600);
+  const tableW = Math.min(W - 60, 650);
   const tableX = (W - tableW) / 2;
 
   if (board.length === 0) {
@@ -942,9 +1146,11 @@ function renderLeaderboard(ctx) {
     ctx.textAlign = 'left';
     ctx.fillText('#', tableX, 95);
     ctx.fillText('Name', tableX + 36, 95);
-    ctx.fillText('Score', tableX + tableW * 0.45, 95);
-    ctx.fillText('Lvl', tableX + tableW * 0.65, 95);
-    ctx.fillText('Stars', tableX + tableW * 0.8, 95);
+    ctx.fillText('Score', tableX + tableW * 0.40, 95);
+    ctx.fillText('Lvl', tableX + tableW * 0.55, 95);
+    ctx.fillText('Stars', tableX + tableW * 0.68, 95);
+    ctx.fillText('IQ', tableX + tableW * 0.82, 95);
+    ctx.fillText('Date', tableX + tableW * 0.90, 95);
 
     ctx.strokeStyle = 'rgba(255,255,255,0.06)';
     ctx.beginPath(); ctx.moveTo(tableX, 102); ctx.lineTo(tableX + tableW, 102); ctx.stroke();
@@ -954,14 +1160,16 @@ function renderLeaderboard(ctx) {
       const e = board[i];
       const y = 124 + i * 28;
       const top3 = i < 3;
-      ctx.font = `${top3 ? 'bold ' : ''}13px "JetBrains Mono", monospace`;
+      ctx.font = `${top3 ? 'bold ' : ''}12px "JetBrains Mono", monospace`;
       ctx.fillStyle = top3 ? '#f0c040' : 'rgba(255,255,255,0.5)';
       ctx.textAlign = 'left';
       ctx.fillText(`${i + 1}`, tableX, y);
       ctx.fillText(e.name, tableX + 36, y);
-      ctx.fillText(`${e.score}`, tableX + tableW * 0.45, y);
-      ctx.fillText(`${e.level}`, tableX + tableW * 0.65, y);
-      ctx.fillText(`${e.stars}\u2605`, tableX + tableW * 0.8, y);
+      ctx.fillText(`${e.score}`, tableX + tableW * 0.40, y);
+      ctx.fillText(`${e.level}`, tableX + tableW * 0.55, y);
+      ctx.fillText(`${e.stars}\u2605`, tableX + tableW * 0.68, y);
+      ctx.fillText(`${e.iq || '?'}`, tableX + tableW * 0.82, y);
+      ctx.fillText(e.date || '', tableX + tableW * 0.90, y);
     }
   }
 
@@ -1001,3 +1209,17 @@ function loop(now) {
 }
 
 requestAnimationFrame(loop);
+
+// Expose for console debugging / hint solving
+window.__hivemind = {
+  getState: () => ({ level, positions, moveCount, playerIQ }),
+  solve: () => {
+    if (!level) return 'No level loaded';
+    if (level.impossible) return 'This level is IMPOSSIBLE! Press I or click IMPOSSIBLE to claim it.';
+    const sol = solveBFS(positions, level.targets, level.grids, level.gridSize, level.portals);
+    if (!sol) return 'No solution found from current state';
+    const arrows = { up: '\u2191 UP', down: '\u2193 DOWN', left: '\u2190 LEFT', right: '\u2192 RIGHT' };
+    return sol.map((d, i) => `Step ${i + 1}: ${arrows[d]}`).join('\n');
+  },
+  isImpossible: () => level ? level.impossible : null
+};

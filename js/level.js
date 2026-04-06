@@ -1,5 +1,6 @@
 // HIVEMIND - Level Generator
 // Generates multi-agent puzzles with guaranteed solvability via reverse-solving.
+// Some levels are intentionally impossible — players can call them out.
 // Each agent has its own maze. All agents share the same input.
 
 export const AGENT_COLORS = ['#ff3e5e', '#3ea8ff', '#3eff8e', '#f0c040', '#c850ff'];
@@ -191,10 +192,75 @@ function reverseSolve(grids, targets, size, solLen, portalSets) {
   return { starts: positions, solution, trivial };
 }
 
+// ── Impossible level generator ─────────────────────────
+
+function generateImpossibleLevel(levelNum) {
+  const cfg = getLevelConfig(levelNum);
+
+  // Try to create a level that BFS confirms is unsolvable
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const grids = [];
+    const portalSets = [];
+    const toggleSets = [];
+
+    // Use higher wall density to increase chance of impossibility
+    const wallFrac = Math.min(cfg.wallFrac + 0.08, 0.35);
+
+    for (let a = 0; a < cfg.numAgents; a++) {
+      const grid = makeGrid(cfg.gridSize, wallFrac);
+      grids.push(grid);
+      portalSets.push([]);
+      toggleSets.push([]);
+    }
+
+    const targets = [];
+    const starts = [];
+    for (let a = 0; a < cfg.numAgents; a++) {
+      targets.push(randomEmptyCell(grids[a], cfg.gridSize));
+      starts.push(randomEmptyCell(grids[a], cfg.gridSize, [targets[a]]));
+    }
+
+    // Quick trivial check
+    const trivial = starts.every((s, i) => s.row === targets[i].row && s.col === targets[i].col);
+    if (trivial) continue;
+
+    // BFS to check solvability (with state limit to prevent freeze)
+    const sol = solveBFS(starts, targets, grids, cfg.gridSize, portalSets, 200000);
+
+    if (sol === null) {
+      // Confirmed impossible!
+      return {
+        level: levelNum,
+        numAgents: cfg.numAgents,
+        gridSize: cfg.gridSize,
+        grids,
+        starts,
+        targets,
+        par: cfg.solLen,
+        solution: null,
+        impossible: true,
+        portals: portalSets,
+        toggleWalls: toggleSets,
+        hasPortals: false,
+        hasToggle: false
+      };
+    }
+  }
+
+  return null; // couldn't generate impossible level
+}
+
 // ── Main level generator ───────────────────────────────
 
 export function generateLevel(levelNum) {
   const cfg = getLevelConfig(levelNum);
+
+  // ~18% chance of impossible level after level 2, only for 2-3 agents
+  if (levelNum > 2 && cfg.numAgents <= 3 && Math.random() < 0.18) {
+    const impossibleLevel = generateImpossibleLevel(levelNum);
+    if (impossibleLevel) return impossibleLevel;
+  }
+
   let attempts = 0;
 
   while (attempts < 50) {
@@ -248,6 +314,8 @@ export function generateLevel(levelNum) {
       starts,
       targets,
       par: solution.length,
+      solution,
+      impossible: false,
       portals: portalSets,
       toggleWalls: toggleSets,
       hasPortals: cfg.hasPortals,
@@ -280,6 +348,40 @@ export function getStars(moves, par) {
   if (moves <= par)      return 3;
   if (moves <= par + 3)  return 2;
   return 1;
+}
+
+// ── BFS Solver ────────────────────────────────────────
+
+export function solveBFS(positions, targets, grids, gridSize, portalSets, maxStates = 500000) {
+  const encodeState = (ps) => ps.map(p => `${p.row},${p.col}`).join('|');
+  const targetKey = encodeState(targets);
+
+  const startKey = encodeState(positions);
+  if (startKey === targetKey) return [];
+
+  const visited = new Set();
+  visited.add(startKey);
+  const queue = [{ positions: positions.map(p => ({ ...p })), moves: [] }];
+
+  while (queue.length > 0) {
+    if (visited.size > maxStates) return null; // state limit reached
+
+    const { positions: cur, moves } = queue.shift();
+
+    for (const dir of DIR_KEYS) {
+      const next = cur.map((p, a) =>
+        moveAgent(p, dir, grids[a], gridSize, portalSets[a] || [])
+      );
+      const key = encodeState(next);
+
+      if (key === targetKey) return [...moves, dir];
+      if (!visited.has(key)) {
+        visited.add(key);
+        queue.push({ positions: next, moves: [...moves, dir] });
+      }
+    }
+  }
+  return null; // no solution found
 }
 
 function shuffle(arr) {

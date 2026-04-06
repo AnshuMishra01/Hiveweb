@@ -1,7 +1,9 @@
-// HIVEMIND - Leaderboard + Progress (localStorage)
+// HIVEMIND - Leaderboard + Progress + Session (localStorage)
 
 const LB_KEY = 'hivemind_leaderboard';
 const PROG_KEY = 'hivemind_progress';
+const SESSION_KEY = 'hivemind_session';
+const IQ_KEY = 'hivemind_iq';
 const MAX_ENTRIES = 20;
 
 // ── Leaderboard ────────────────────────────────────────
@@ -12,13 +14,14 @@ export function getLeaderboard() {
   } catch { return []; }
 }
 
-export function addEntry(name, totalScore, maxLevel, totalStars) {
+export function addEntry(name, totalScore, maxLevel, totalStars, iq) {
   const board = getLeaderboard();
   board.push({
     name: name.slice(0, 16),
     score: totalScore,
     level: maxLevel,
     stars: totalStars,
+    iq: iq || 100,
     date: new Date().toISOString().split('T')[0]
   });
   board.sort((a, b) => b.score - a.score);
@@ -58,4 +61,55 @@ export function getMaxUnlockedLevel() {
 export function getTotalStars() {
   const prog = getProgress();
   return Object.values(prog).reduce((sum, p) => sum + (p.stars || 0), 0);
+}
+
+// ── IQ Tracking ────────────────────────────────────────
+
+export function getIQ() {
+  try {
+    const val = parseInt(localStorage.getItem(IQ_KEY));
+    return isNaN(val) ? 100 : val;
+  } catch { return 100; }
+}
+
+export function setIQ(val) {
+  const clamped = Math.max(50, Math.min(300, Math.round(val)));
+  localStorage.setItem(IQ_KEY, String(clamped));
+  return clamped;
+}
+
+export function adjustIQ(delta) {
+  return setIQ(getIQ() + delta);
+}
+
+// ── Session Persistence ────────────────────────────────
+
+export function saveSession(data) {
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify({
+      levelNum: data.levelNum,
+      totalScore: data.totalScore,
+      totalStars: data.totalStars,
+      lives: data.lives,
+      timestamp: Date.now()
+    }));
+  } catch { /* ignore */ }
+}
+
+export function loadSession() {
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    // Session expires after 24 hours
+    if (Date.now() - data.timestamp > 24 * 60 * 60 * 1000) {
+      clearSession();
+      return null;
+    }
+    return data;
+  } catch { return null; }
+}
+
+export function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
 }
