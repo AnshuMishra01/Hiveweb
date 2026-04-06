@@ -1,90 +1,58 @@
-// HIVEMIND - Leaderboard (PostgreSQL API) + Local Progress/Session (localStorage)
+// HIVEMIND - Leaderboard + Progress + Session (localStorage)
 
+const LB_KEY = 'hivemind_leaderboard';
 const PROG_KEY = 'hivemind_progress';
 const SESSION_KEY = 'hivemind_session';
 const IQ_KEY = 'hivemind_iq';
+const MAX_ENTRIES = 25;
 
-// ── Shared Leaderboard (API) ───────────────────────────
+// ── Leaderboard ────────────────────────────────────────
 
-export async function getLeaderboard() {
-  try {
-    const res = await fetch('/api/leaderboard');
-    if (!res.ok) throw new Error('API error');
-    const rows = await res.json();
-    return rows.map(r => ({
-      name: r.name,
-      score: r.score,
-      level: r.level,
-      stars: r.stars,
-      iq: r.iq,
-      date: r.created_at ? r.created_at.split('T')[0] : ''
-    }));
-  } catch (err) {
-    console.warn('Leaderboard fetch failed, using local fallback:', err.message);
-    return getLocalLeaderboard();
-  }
-}
-
-export async function addEntry(name, totalScore, maxLevel, totalStars, iq) {
-  try {
-    const res = await fetch('/api/leaderboard', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        name: name.slice(0, 16),
-        score: totalScore,
-        level: maxLevel,
-        stars: totalStars,
-        iq: iq || 100
-      })
-    });
-    if (!res.ok) throw new Error('API error');
-    return await getLeaderboard();
-  } catch (err) {
-    console.warn('Leaderboard save failed, using local fallback:', err.message);
-    return addLocalEntry(name, totalScore, maxLevel, totalStars, iq);
-  }
-}
-
-export async function getRank(score) {
-  try {
-    const res = await fetch(`/api/leaderboard/rank/${score}`);
-    if (!res.ok) throw new Error('API error');
-    const data = await res.json();
-    return data.rank;
-  } catch {
-    const board = getLocalLeaderboard();
-    return board.filter(e => e.score > score).length + 1;
-  }
-}
-
-// ── Local fallback (if API is down) ────────────────────
-
-const LB_KEY = 'hivemind_leaderboard';
-
-function getLocalLeaderboard() {
+function getLocalBoard() {
   try {
     return JSON.parse(localStorage.getItem(LB_KEY)) || [];
   } catch { return []; }
 }
 
-function addLocalEntry(name, totalScore, maxLevel, totalStars, iq) {
-  const board = getLocalLeaderboard();
-  board.push({
-    name: name.slice(0, 16),
-    score: totalScore,
-    level: maxLevel,
-    stars: totalStars,
-    iq: iq || 100,
-    date: new Date().toISOString().split('T')[0]
-  });
+export async function getLeaderboard() {
+  return getLocalBoard();
+}
+
+export async function addEntry(name, totalScore, maxLevel, totalStars, iq) {
+  const board = getLocalBoard();
+  const cleanName = name.slice(0, 16);
+
+  // Upsert — update if name exists with better score, otherwise add
+  const existing = board.findIndex(e => e.name.toLowerCase() === cleanName.toLowerCase());
+  if (existing >= 0) {
+    const e = board[existing];
+    e.score = Math.max(e.score, totalScore);
+    e.level = Math.max(e.level, maxLevel);
+    e.stars = Math.max(e.stars, totalStars);
+    e.iq = iq || e.iq;
+    e.date = new Date().toISOString().split('T')[0];
+  } else {
+    board.push({
+      name: cleanName,
+      score: totalScore,
+      level: maxLevel,
+      stars: totalStars,
+      iq: iq || 100,
+      date: new Date().toISOString().split('T')[0]
+    });
+  }
+
   board.sort((a, b) => b.score - a.score);
-  if (board.length > 20) board.length = 20;
+  if (board.length > MAX_ENTRIES) board.length = MAX_ENTRIES;
   localStorage.setItem(LB_KEY, JSON.stringify(board));
   return board;
 }
 
-// ── Level progress (local) ─────────────────────────────
+export async function getRank(score) {
+  return getLocalBoard().filter(e => e.score > score).length + 1;
+}
+
+// ── Level progress ─────────────────────────────────────
 
 export function getProgress() {
   try {
@@ -113,7 +81,7 @@ export function getTotalStars() {
   return Object.values(prog).reduce((sum, p) => sum + (p.stars || 0), 0);
 }
 
-// ── IQ Tracking (local) ───────────────────────────────
+// ── IQ Tracking ────────────────────────────────────────
 
 export function getIQ() {
   try {
@@ -132,7 +100,7 @@ export function adjustIQ(delta) {
   return setIQ(getIQ() + delta);
 }
 
-// ── Session Persistence (local) ────────────────────────
+// ── Session Persistence ────────────────────────────────
 
 export function saveSession(data) {
   try {

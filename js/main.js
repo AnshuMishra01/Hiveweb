@@ -16,8 +16,9 @@ import * as dialogue from './dialogue.js';
 import * as tts from './tts.js';
 
 // ── Constants ──────────────────────────────────────────
-const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4, AGE_GATE: 5 };
+const State = { MENU: 0, PLAYING: 1, WIN: 2, GAME_OVER: 3, LEADERBOARD: 4, AGE_GATE: 5, VICTORY: 6 };
 const ANIM_DURATION = 130; // ms
+const MAX_LEVEL = 25;
 
 // ── State ──────────────────────────────────────────────
 let state = State.MENU;
@@ -283,7 +284,7 @@ function handleClick(cx, cy) {
     return;
   }
 
-  if (state === State.GAME_OVER) {
+  if (state === State.GAME_OVER || state === State.VICTORY) {
     if (cx > W / 2 - 100 && cx < W / 2 + 100 && cy > H * 0.7 && cy < H * 0.7 + 54) {
       state = State.MENU; audio.playClick();
     }
@@ -357,21 +358,8 @@ async function startGame() {
 function changeName() {
   const name = prompt(`Current name: ${playerName}\n\nEnter new name (or cancel):`);
   if (name && name.trim()) {
-    const clean = name.trim().slice(0, 16);
-    fetch(`/api/leaderboard/check/${encodeURIComponent(clean)}`)
-      .then(r => r.json())
-      .then(data => {
-        if (data.available) {
-          playerName = clean;
-          localStorage.setItem('hivemind_name', clean);
-        } else {
-          alert(`"${clean}" is already taken!`);
-        }
-      })
-      .catch(() => {
-        playerName = clean;
-        localStorage.setItem('hivemind_name', clean);
-      });
+    playerName = name.trim().slice(0, 16);
+    localStorage.setItem('hivemind_name', playerName);
   }
 }
 
@@ -654,8 +642,39 @@ function onWin() {
 }
 
 function nextLevel() {
+  if (levelNum >= MAX_LEVEL) {
+    gameComplete();
+    return;
+  }
   levelNum++;
   loadLevel(levelNum);
+}
+
+function gameComplete() {
+  clearSession();
+  state = State.VICTORY;
+  audio.playWin();
+
+  // Save final score
+  if (playerName) {
+    addEntry(playerName, totalScore, levelNum, totalStars, playerIQ)
+      .then(() => refreshLeaderboard()).catch(() => {});
+  }
+
+  // Big celebration
+  for (let i = 0; i < 80; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const speed = 2 + Math.random() * 6;
+    particles.push({
+      x: W / 2 + (Math.random() - 0.5) * W * 0.6,
+      y: H * 0.3 + (Math.random() - 0.5) * 100,
+      vx: Math.cos(angle) * speed,
+      vy: Math.sin(angle) * speed - 3,
+      life: 1,
+      color: AGENT_COLORS[Math.floor(Math.random() * 5)],
+      r: 2 + Math.random() * 6
+    });
+  }
 }
 
 function promptName() {
@@ -679,20 +698,9 @@ function promptName() {
 }
 
 async function askForUniqueName(message) {
-  while (true) {
-    const name = prompt(message);
-    if (!name || !name.trim()) return null;
-    const clean = name.trim().slice(0, 16);
-    try {
-      const res = await fetch(`/api/leaderboard/check/${encodeURIComponent(clean)}`);
-      const data = await res.json();
-      if (data.available) return clean;
-      message = `"${clean}" is already taken! Pick another name:`;
-    } catch {
-      // API down — allow it locally
-      return clean;
-    }
-  }
+  const name = prompt(message);
+  if (!name || !name.trim()) return null;
+  return name.trim().slice(0, 16);
 }
 
 function undo() {
@@ -767,6 +775,7 @@ function render(now) {
   else if (state === State.MENU) renderMenu(ctx, now);
   else if (state === State.PLAYING || state === State.WIN) renderGame(ctx);
   else if (state === State.GAME_OVER) renderGameOver(ctx);
+  else if (state === State.VICTORY) renderVictory(ctx);
   else if (state === State.LEADERBOARD) renderLeaderboard(ctx);
 
   drawParticles();
@@ -1216,6 +1225,42 @@ function renderGameOver(ctx) {
   });
 
   renderer.text(`Leaderboard: #${cachedRank}`, W / 2, H * 0.34 + lines.length * 32 + 18, {
+    color: cachedRank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 14
+  });
+
+  const bh = isInside(mouseX, mouseY, { x: W / 2 - 100, y: H * 0.7, w: 200, h: 54 });
+  renderer.drawButton(W / 2 - 100, H * 0.7, 200, 54, 'MAIN MENU', bh, true);
+}
+
+function renderVictory(ctx) {
+  ctx.save();
+  ctx.shadowColor = '#f0c040';
+  ctx.shadowBlur = 25;
+  renderer.text('YOU WIN', W / 2, H * 0.15, { color: '#f0c040', size: 48, bold: true });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  ctx.save();
+  ctx.shadowColor = '#3eff8e';
+  ctx.shadowBlur = 10;
+  renderer.text('All 25 levels completed!', W / 2, H * 0.24, { color: '#3eff8e', size: 18 });
+  ctx.shadowBlur = 0;
+  ctx.restore();
+
+  const lines = [
+    `Final Score: ${totalScore}`,
+    `Stars Earned: ${totalStars} / 75`,
+    `IQ: ${playerIQ}`,
+    `Rating: ${getDifficulty(levelNum).name}`,
+    playerName ? `Player: ${playerName}` : ''
+  ].filter(Boolean);
+
+  lines.forEach((l, i) => {
+    const c = i === 2 ? '#f0c040' : 'rgba(255,255,255,0.6)';
+    renderer.text(l, W / 2, H * 0.36 + i * 30, { color: c, size: 15 });
+  });
+
+  renderer.text(`Leaderboard: #${cachedRank}`, W / 2, H * 0.36 + lines.length * 30 + 20, {
     color: cachedRank <= 3 ? '#f0c040' : 'rgba(255,255,255,0.35)', size: 14
   });
 
